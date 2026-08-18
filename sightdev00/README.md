@@ -10,14 +10,77 @@
 - 总览文档只维护稳定的系统模型；高频变化的实现细节、版本差异和实验记录拆分到独立文档。
 - 引用外部 Harness 实践时，优先区分“源码事实”“官方经验”“社区一线问题报告”和“我的综合判断”，避免把二手经验写成源码事实。
 - 不把“框架新增了什么能力”自动等同于“Agent 系统能力提升”；优先追踪真实任务、failure mode、验证闭环和 ablation 证据。
+- 研究目标不是证明 DeepSeek Harness 正确或错误，而是建立一套可以被源码、实验和后续版本持续反证的 Agent Systems Engineering 认知。
 
 ## 当前文档
 
 1. [DeepSeek Harness 源码架构思想](01-deepseek-harness-source-architecture.md)
 2. [Agent Harness 工程系统综述：DeepSeek Harness、Codex、Claude Code](02-agent-harness-engineering-systematic-review.md)
 3. [从 Harness-first 到 Problem-first：Agent 系统研究的正确因果方向](03-problem-first-agent-systems-research.md)
+4. [Harness 深度研究与小组分享计划](04-harness-deep-study-and-team-sharing-plan.md)
+5. [Harness 实验记录规范](experiments/README.md)
 
-第三篇不是简单追加 Harness 功能，而是对研究方法做上移：真实问题与可复现 failure 应先于 Runtime abstraction，生态与标准应当是长期问题求解后收敛出的结果，而不是预设目标。
+前三篇形成当前认知基础：
+
+```text
+01  DeepSeek Harness 到底如何设计
+ ↓
+02  放到 Codex / Claude 的 Harness Engineering 中如何理解
+ ↓
+03  Harness 研究本身应该遵循什么因果方向
+```
+
+第四篇开始进入下一阶段：不再继续堆积阅读笔记，而是用 6 周完成“源码 → failure → 对照 → 实验 → 真实业务 → 小组分享”的完整研究闭环。
+
+## 当前研究路线：2026-08-19 ～ 2026-09-27
+
+```text
+Week 1
+源码主干 / Runtime / Durable State / Ownership
+        ↓
+Week 2
+Failure path / Recovery / Failure Taxonomy
+        ↓
+Week 3
+Codex / Claude 对照与反事实分析
+        ↓
+Week 4
+受控实验：Recovery + Ownership / Concurrency
+        ↓
+Week 5
+真实业务工作流实验
+        ↓
+Week 6
+实验报告 / 反证 / 小组分享
+```
+
+最终要求不是“熟悉一个框架”，而是留下：
+
+```text
+源码系统模型
++
+Failure Taxonomy
++
+可重复实验方法
++
+真实 Failure Evidence
++
+Abstraction 判断方法
++
+业务 Agent 系统案例
++
+团队共享语言
+```
+
+## 研究中的核心判断
+
+当前假设是：
+
+> **真实问题 → 可重复 failure → 最小 Harness intervention → verification / ablation → 跨任务重复 → 稳定 abstraction → framework / ecosystem。**
+
+这只是研究假设，不是需要维护的立场。
+
+如果后续 DeepSeek 提供真实任务数据，或者自己的实验显示 ecosystem-first / runtime-first 在实践中具有更强解释力，应直接修改当前判断。
 
 ## 建议的上游同步方式
 
