@@ -1,17 +1,19 @@
+import { brandString } from '@deepseek-ai/dsh-brand'
 import { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import SessionStore, { SessionLogOffset, SessionSeq, SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
+import SessionStore, { SessionLogOffset, SessionSeq, SESSION_FORMAT_VERSION, type SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, SessionHeader, SessionId as SessionIdType } from '@deepseek-ai/dsh-session'
 import SessionPersistence, {
   SessionPersistenceCorruptionError,
   SessionPersistenceNotFoundError,
-  SessionPersistenceRevision,
+  type SessionPersistenceRevision,
   SessionReadOnlyError,
 } from '@deepseek-ai/dsh-session-persistence'
 import type {
   SessionAccess,
   SessionHandle,
   SessionHandleReadOptions,
+  SessionHandleReadResult,
   SessionPersistenceSnapshot,
   SessionPersistenceStatOptions,
 } from '@deepseek-ai/dsh-session-persistence'
@@ -20,7 +22,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { SessionObservationReader } from '../src/observation.ts'
 
 function header(id: string): SessionHeader {
-  return { version: SESSION_FORMAT_VERSION, id: SessionId(id), createdAt: 1, isSeeded: false, cwd: '/workspace' }
+  return { version: SESSION_FORMAT_VERSION, id: brandString<SessionId>(id), createdAt: 1, isSeeded: false, cwd: '/workspace' }
 }
 
 function messageEvent(seq: number, text: string): SessionEvent {
@@ -60,6 +62,8 @@ interface StubHooks {
   onStat?: () => void
   /** Runs inside `read` before it resolves. */
   onRead?: () => void
+  /** Observes the detached values returned by `read`. */
+  onReadResult?: (events: SessionEvent[]) => void
   /** Replaces the read result for every open handle. */
   readFailure?: unknown
   /** Replaces the stat result. */
@@ -88,7 +92,7 @@ function stubPersistence(
     if (entry === undefined) return Promise.resolve(undefined)
     return Promise.resolve({
       header: structuredClone(entry.header),
-      revision: SessionPersistenceRevision(entry.revision),
+      revision: brandString<SessionPersistenceRevision>(entry.revision),
     })
   }
   const open = (id: SessionIdType, access: SessionAccess): Promise<SessionHandle> => {
@@ -104,7 +108,7 @@ function stubPersistence(
         _offset?: number,
         _length?: number,
         options?: SessionHandleReadOptions,
-      ): Promise<readonly SessionEvent[]> => {
+      ): Promise<SessionHandleReadResult> => {
         counters.read += 1
         void options
         hooks.onRead?.()
@@ -112,7 +116,9 @@ function stubPersistence(
           // oxlint-disable-next-line typescript/prefer-promise-reject-errors
           return Promise.reject(hooks.readFailure)
         }
-        return Promise.resolve(structuredClone(entry.events))
+        const events = structuredClone(entry.events)
+        hooks.onReadResult?.(events)
+        return Promise.resolve({ eventState: 'detached', events })
       },
       append: () => Promise.reject(new SessionReadOnlyError(id, 'append')),
       flush: () => Promise.reject(new SessionReadOnlyError(id, 'flush')),
@@ -133,7 +139,7 @@ async function readerContext(): Promise<Context> {
 describe('SessionObservationReader live path', () => {
   it('creates independent live leases and rejects retention after disposal', async () => {
     const ctx = await readerContext()
-    const session = ctx.sessions.create(SessionId('live-leases'), { meta: { cwd: '/workspace' } })
+    const session = ctx.sessions.create(brandString<SessionId>('live-leases'), { meta: { cwd: '/workspace' } })
     const reader = new SessionObservationReader(ctx)
     const observed = await reader.read(session.id, { projectionMode: 'none' })
     const retained = observed.retain()
@@ -145,25 +151,63 @@ describe('SessionObservationReader live path', () => {
     await ctx.fiber.dispose()
   })
 
-  it('computes live projections when the registry is mounted and surfaces its failure raw', async () => {
+  it('computes live projections and wraps projection failures as corrupt-session errors', async () => {
     const ctx = await readerContext()
     await ctx.plugin(SessionProjectionRegistry)
-    const session = ctx.sessions.create(SessionId('live-projections'))
+    const session = ctx.sessions.create(brandString<SessionId>('live-projections'))
     const reader = new SessionObservationReader(ctx)
 
     using observed = await reader.read(session.id)
     expect(observed.projections).toBeDefined()
 
-    vi.spyOn(ctx.sessionProjections, 'snapshot').mockImplementation(() => {
-      throw new Error('projection failed')
+    const failure = new Error('projection failed')
+    vi.spyOn(ctx.sessionProjections, 'snapshot').mockImplementation(() => { throw failure })
+    await expect(reader.read(session.id)).rejects.toMatchObject({
+      code: 'SESSION_QUERY_CORRUPT_SESSION',
+      message: `failed to project session "${session.id}": projection failed`,
+      cause: failure,
     })
-    await expect(reader.read(session.id)).rejects.toThrow('projection failed')
+    await ctx.fiber.dispose()
+  })
+
+  it('materializes live events only on first read and shares them across leases', async () => {
+    const ctx = await readerContext()
+    const session = ctx.sessions.create(brandString<SessionId>('live-lazy-events'))
+    session.append('turn/start', { turn: 1 })
+    const snapshotEvents = vi.spyOn(session, 'snapshotEvents')
+    const reader = new SessionObservationReader(ctx)
+
+    using observed = await reader.read(session.id, { projectionMode: 'none' })
+    using retained = observed.retain()
+    expect(observed.cursor).toBe(0)
+    expect(snapshotEvents).not.toHaveBeenCalled()
+
+    expect(retained.events).toBe(observed.events)
+    expect(observed.events.map(event => event.type)).toEqual(['turn/start'])
+    expect(snapshotEvents).toHaveBeenCalledOnce()
+    await ctx.fiber.dispose()
+  })
+
+  it('keeps a live cut fixed when the log grows before events are first read', async () => {
+    const ctx = await readerContext()
+    const session = ctx.sessions.create(brandString<SessionId>('live-fixed-cut'))
+    session.append('turn/start', { turn: 1 })
+    const reader = new SessionObservationReader(ctx)
+
+    using observed = await reader.read(session.id, { projectionMode: 'none' })
+    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    using later = await reader.read(session.id, { projectionMode: 'none' })
+
+    expect(observed.cursor).toBe(0)
+    expect(observed.events.map(event => event.type)).toEqual(['turn/start'])
+    expect(later.cursor).toBe(1)
+    expect(later.events.map(event => event.type)).toEqual(['turn/start', 'turn/end'])
     await ctx.fiber.dispose()
   })
 
   it('reports a missing session when no persistence service is mounted', async () => {
     const ctx = await readerContext()
-    await expect(new SessionObservationReader(ctx).read(SessionId('absent'))).rejects.toMatchObject({
+    await expect(new SessionObservationReader(ctx).read(brandString<SessionId>('absent'))).rejects.toMatchObject({
       code: 'SESSION_QUERY_SESSION_NOT_FOUND',
     })
     await ctx.fiber.dispose()
@@ -176,15 +220,21 @@ describe('SessionObservationReader cold path', () => {
     const meta = header('interrupted-cold')
     const store = new Map([[meta.id, { header: meta, events: interruptedLog('crashed'), revision: 'r1' }]])
     const counters = { stat: 0, open: 0, read: 0 }
-    ctx.provide('sessionPersistence', stubPersistence(store, counters))
+    let restoredSource: SessionEvent[] | undefined
+    ctx.provide('sessionPersistence', stubPersistence(store, counters, {
+      onReadResult: (events) => { restoredSource = events },
+    }))
     const reader = new SessionObservationReader(ctx)
 
     using observed = await reader.read(meta.id)
 
     expect(observed.source).toBe('prepared')
     expect(observed.header).toMatchObject({ id: meta.id, cwd: '/workspace' })
-    expect(observed.revision).toBe(SessionPersistenceRevision('r1'))
+    expect(observed.revision).toBe(brandString<SessionPersistenceRevision>('r1'))
+    expect(observed.persistedEventCount).toBe(2)
     expect(observed.events.map(event => event.type)).toEqual(['turn/start', 'user/message', 'turn/end'])
+    expect(observed.events[0]).toBe(restoredSource?.[0])
+    expect(Object.isFrozen(restoredSource?.[0]?.data)).toBe(false)
     expect(observed.cursor).toBe(2)
     // No projection registry is mounted, so the observation carries none.
     expect(observed.projections).toBeUndefined()
@@ -202,6 +252,7 @@ describe('SessionObservationReader cold path', () => {
     using observed = await new SessionObservationReader(ctx).read(meta.id, { projectionMode: 'none' })
 
     expect(observed.events).toEqual([])
+    expect(observed.persistedEventCount).toBe(0)
     expect(observed.cursor).toBe(-1)
     await ctx.fiber.dispose()
   })
@@ -256,7 +307,7 @@ describe('SessionObservationReader cold path', () => {
     expect(counters).toEqual({ stat: 2, open: 2, read: 2 })
     expect(first.cursor).toBe(0)
     expect(second.cursor).toBe(1)
-    expect(second.revision).toBe(SessionPersistenceRevision('r2'))
+    expect(second.revision).toBe(brandString<SessionPersistenceRevision>('r2'))
     await ctx.fiber.dispose()
   })
 
@@ -418,9 +469,9 @@ describe('SessionObservationReader cold path', () => {
     class SwapHandle implements SessionHandle {
       readonly inheritedEventCount = SessionLogOffset(0)
       constructor(readonly id: SessionIdType, readonly header: SessionHeader, readonly access: SessionAccess) {}
-      read(): Promise<readonly SessionEvent[]> {
+      read(): Promise<SessionHandleReadResult> {
         SwapPersistence.readCalls += 1
-        return Promise.resolve([messageEvent(0, 'swap')])
+        return Promise.resolve({ eventState: 'detached', events: [messageEvent(0, 'swap')] })
       }
 
       append(): Promise<void> {
@@ -457,7 +508,7 @@ describe('SessionObservationReader cold path', () => {
       stat(): Promise<SessionPersistenceSnapshot | undefined> {
         return Promise.resolve({
           header: structuredClone(meta),
-          revision: SessionPersistenceRevision('constant'),
+          revision: brandString<SessionPersistenceRevision>('constant'),
         })
       }
 
@@ -608,7 +659,7 @@ describe('SessionObservationReader cold path', () => {
     const ctx = await readerContext()
     const meta = header('expected-id')
     const store = new Map([[meta.id, {
-      header: { ...meta, id: SessionId('other-id') },
+      header: { ...meta, id: brandString<SessionId>('other-id') },
       events: [messageEvent(0, 'other')],
       revision: 'r1',
     }]])

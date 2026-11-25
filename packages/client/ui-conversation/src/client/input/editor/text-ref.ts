@@ -1,19 +1,10 @@
-/**
- * Plain-text reference decoration (the plain-text-reference decision;
- * see .agents/notes/implemented/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md):
- * a `/name` or `@name` token whose name is on the trigger's lexicon, and
- * syntax-recognizable `@dir/` folder tokens, render in the chip family
- * colors. Color only, no icon: a token still carrying its trigger character
- * is editable text, not a settled chip — the domain icon marks exactly the
- * settled state. Pure derivation as before — the entity transform converts
- * matching text into TextRefNode and back as edits move it in and out of
- * match shape; no occurrence identity exists.
- */
+/** Editable reference tokens share chip hover styling while retaining ordinary text semantics. */
+import clsx from 'clsx'
 import type { EditorConfig, LexicalEditor, SerializedTextNode } from 'lexical'
 import { TextNode } from 'lexical'
 import { registerLexicalTextEntity } from '@lexical/text'
 import { mergeRegister } from '@lexical/utils'
-import { $getRoot } from 'lexical'
+import { $getRoot, HISTORY_MERGE_TAG } from 'lexical'
 import { scanTextRefs } from '../decorations.ts'
 import css from './composer-editor.module.css'
 
@@ -61,7 +52,8 @@ export class TextRefNode extends TextNode {
   /** Style the span the base TextNode mounts. */
   override createDOM(config: EditorConfig): HTMLElement {
     const el = super.createDOM(config)
-    el.classList.add(css.textRef ?? 'textRef')
+    el.className = clsx(el.className, css.reference, css.textRef, this.getTextContent().startsWith('/') && css.openable)
+    el.setAttribute('spellcheck', 'false')
     el.setAttribute('data-composer-text-ref', '')
     return el
   }
@@ -77,31 +69,47 @@ export class TextRefNode extends TextNode {
   }
 }
 
+/** First reference range of a text, or null. */
+type TextRefMatch = (text: string) => { start: number; end: number } | null
+
 /**
- * Register the plain-text reference entity transform. The claim decoration
- * has precedence on the leading-token seat: while a command claim holds, the
- * claimed token must stay a plain TextNode (transforms register per concrete
- * node class, so a TextRefNode would never receive the TextNode claim
- * transform and the warn color would be lost).
+ * Extend a text-ref over the plain text directly after it when both together
+ * match one reference, such as `@src/a` followed by `.ts`. A selection point
+ * in the moved text stays beside the same character.
+ * @param node - plain text node the editor marked dirty.
+ * @param getMatch - the reference matcher.
+ */
+function $growTextRef(node: TextNode, getMatch: TextRefMatch): void {
+  const textRef = node.getPreviousSibling()
+  if (!(textRef instanceof TextRefNode)) return
+  const length = textRef.getTextContentSize()
+  const match = getMatch(textRef.getTextContent() + node.getTextContent())
+  if (match === null || match.end <= length) return
+  if (match.end - length < node.getTextContentSize()) node.splitText(match.end - length)
+  // A split keeps the leading text under this node's key, possibly in a new writable copy.
+  textRef.mergeWithSibling(node.getLatest())
+}
+
+/**
+ * Register the plain-text reference entity transform.
  * @param editor - the shell-owned editor.
  * @param lexiconOf - live per-trigger name-roll accessor (the controller's aggregated store).
- * @param activeToken - live claim token accessor; null while unclaimed.
  * @returns the unregister disposer.
  */
 export function registerTextRefDecoration(
   editor: LexicalEditor,
   lexiconOf: () => ReadonlyMap<'/' | '@', readonly string[]>,
-  activeToken: () => string | null,
 ): () => void {
-  const getMatch = (text: string): { start: number; end: number } | null => {
-    const claim = activeToken()
-    for (const range of scanTextRefs(text, lexiconOf())) {
-      if (claim !== null && range.start === 0 && text.slice(range.start, range.end) === claim) continue
-      return { start: range.start, end: range.end }
-    }
-    return null
+  const getMatch: TextRefMatch = (text) => {
+    const range = scanTextRefs(text, lexiconOf())[0]
+    return range === undefined ? null : { start: range.start, end: range.end }
   }
   return mergeRegister(
+    // The entity transforms below also extend a text-ref over following text, but collapse the
+    // selection to the text-ref's previous end first, so the next typed character lands before
+    // the moved text (https://github.com/facebook/lexical/issues/3054). Transforms of one node
+    // type run in registration order; this one leaves them nothing to extend.
+    editor.registerNodeTransform(TextNode, (node) => { $growTextRef(node, getMatch) }),
     ...registerLexicalTextEntity(
       editor,
       getMatch,
@@ -120,5 +128,5 @@ export function registerTextRefDecoration(
 export function rescanTextRefs(editor: LexicalEditor): void {
   editor.update(() => {
     for (const node of $getRoot().getAllTextNodes()) node.markDirty()
-  })
+  }, { tag: HISTORY_MERGE_TAG })
 }

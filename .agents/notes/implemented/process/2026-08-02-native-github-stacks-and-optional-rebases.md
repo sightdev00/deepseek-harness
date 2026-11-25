@@ -4,6 +4,8 @@ Status: implemented
 
 English | [中文](2026-08-02-native-github-stacks-and-optional-rebases.zh.md)
 
+The equal choice between merge-forward and rebase below is superseded by [rebase with rerere](2026-11-19-prefer-rebase-with-rerere.md), which keeps merge-forward for an explicit PR author request. Stack linkage, landing, lease protection, and post-rewrite audits remain current.
+
 ## Problem
 
 A dependent PR chain represented only by base branches has no official stack identity. Landing it requires manually merging one PR at a time, preserving intermediate branches, retargeting every child, and reconstructing whether the chain survived. GitHub's native stacked-PR feature instead carries the order, applies trunk rules and CI to every layer, and owns bottom-up merges and retargeting.
@@ -16,7 +18,7 @@ Every same-repository chain of two or more dependent PRs uses GitHub's official 
 
 "Land the stack" merges the complete official stack through `gh stack merge <stack-number> --yes --merge`. A partial landing requires an explicit boundary PR and merges the bottom prefix through that PR. The workflow never falls back to per-PR `gh pr merge` and manual retargeting. A direct native merge is all-or-nothing; a merge queue may process the selected PRs in separate groups, so every selected PR must independently reach `MERGED` before the landing is complete.
 
-Merge-forward and rebase are both allowed refresh histories for standalone and officially stacked PRs, including after review. A remote history rewrite uses an exact lease or the lease-protected `gh stack` push path and aborts if the remote moved; raw `--force` is forbidden. The [incremental base-retargeting decision](2026-07-26-incremental-pr-base-retargeting.md) remains the owner of the merge-forward option.
+Merge-forward and rebase are both allowed refresh histories for standalone and officially stacked PRs, including after review. A remote history rewrite uses an exact lease or the lease-protected `gh stack` push path and aborts if the remote moved; raw `--force` is forbidden. The [incremental base-retargeting decision](../../archived/process/2026-07-26-incremental-pr-base-retargeting.md) remains the owner of the merge-forward option.
 
 Relevant checks normally run before publication. `gh stack sync` is the explicit exception because it fetches, cascade-rebases, and pushes as one operation: every rewritten layer is validated immediately afterward, and no affected PR merges until that evidence passes. After any rewritten push, current heads, unresolved review threads, approvals, mergeability, and checks are re-audited because earlier commit OIDs and inline anchors may be outdated.
 

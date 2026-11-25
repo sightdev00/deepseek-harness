@@ -4,7 +4,7 @@ Status: implemented
 
 [English](2026-07-30-credential-boundaries-and-atomic-registration.md) | 中文
 
-> 范围：加固[请求级 LLM（大语言模型）配置边界](2026-07-29-request-level-llm-config-credentials.zh.md)——存下来的凭据落在哪里、谁能读到它，一次请求所用的事实如何保持在同一代，以及一组路由如何在不留空窗的前提下更换。本 note 与 [settings 写路径 note](2026-07-30-settings-write-path-integrity.zh.md) 配套：它把那篇 note 的提供方修复套用到 `credentials-local`，并把其中的写锁提升进 `dsh-atomic-write`。
+> 范围：加固[请求级 LLM（大语言模型）配置边界](../../archived/architecture/2026-07-29-request-level-llm-config-credentials.md)——存下来的凭据落在哪里、谁能读到它，一次请求所用的事实如何保持在同一代，以及一组路由如何在不留空窗的前提下更换。本 note 与 [settings 写路径 note](../../archived/architecture/2026-07-30-settings-write-path-integrity.md) 配套：它把那篇 note 的提供方修复套用到 `credentials-local`，并把其中的写锁提升进 `dsh-atomic-write`。
 
 ## 问题
 
@@ -18,15 +18,15 @@ Status: implemented
 
 ## 决策
 
-**凭据文档只归凭据提供方所有。**没有任何一个面会把它加载进 `process.env`。当时该文档是 `$DSH_HOME/.env`；[凭据文档拆分](2026-08-04-credentials-yaml-and-user-environment-layer.zh.md)后来把它移到 `$DSH_HOME/.credentials.yaml`，因此 `$DSH_HOME/.env` 是用户的普通环境层，其中不含任何提供方管理的密钥。真正的启动环境，以及调用目录中由 bin 加载的 `.env`，仍然是那一层只读的环境来源，因此不挂载该提供方的组合，解析密钥的方式与从前完全一致，而存下的密钥跨重启仍然来源于文件、仍然可写——这一点由 loader 组合中的一次真实重启来证明，而不是靠对 `describe()` 的单元断言。
+**凭据文档只归凭据提供方所有。**没有任何一个面会把它加载进 `process.env`。当时该文档是 `$DSH_HOME/.env`；[凭据文档拆分](../../archived/architecture/2026-08-04-credentials-yaml-and-user-environment-layer.md)后来把它移到 `$DSH_HOME/.credentials.yaml`，因此 `$DSH_HOME/.env` 是用户的普通环境层，其中不含任何提供方管理的密钥。真正的启动环境，以及调用目录中由 bin 加载的 `.env`，仍然是那一层只读的环境来源，因此不挂载该提供方的组合，解析密钥的方式与从前完全一致，而存下的密钥跨重启仍然来源于文件、仍然可写——这一点由 loader 组合中的一次真实重启来证明，而不是靠对 `describe()` 的单元断言。
 
 **存下的凭据对模型没有边界，而 README 就是这么写的。**`0700` 目录下的 `0600` 挡得住其他 OS 用户；模型的 bash 与文件系统工具正是以同一用户身份运行，而已交付的默认配置不提供任何约束。harness 真正守住的边界更窄，文档也严格按这一范围表述：没有任何一个面会把该文档提升进 `process.env`，模型也从不会拿到它的解析后路径，因此要拿到这个值，需要刻意去读一条并未交给它的路径。OS 钥匙串（keychain）提供方——一个模型的进程根本读不到的存储——被记录为真正的答案，而不是靠一个残缺的方案去暗示它。
 
-**一次请求，一代设置。**DeepSeek 解析出的快照在端点旁一并携带凭据引用，`resolveApiKey` 接收这份快照，而不再重新读取配置。被拒绝的那一代如今完全不再贡献任何东西。只有当一个 profile 完全没有点名凭据时，pi-ai 才交给提供方原生的发现流程；配置了引用却解析不到，就以 `MISSING_CREDENTIAL` 失败，并点名该路由与该引用。启动时的凭据探测被删除：它可能在凭据服务挂载之前就运行，并把每一种失败都报成密钥缺失，而第一次请求本就会给出准确的错误。
+**一次请求，一代设置。**DeepSeek 解析出的快照在端点旁一并携带凭据引用，API 密钥路由的 `resolveAuth` 把这份快照的端点和引用交给 `ctx.deepseekAuth`，而不再重新读取配置。被拒绝的那一代如今完全不再贡献任何东西。只有当一个 profile 完全没有点名凭据时，pi-ai 才交给提供方原生的发现流程；配置了引用却解析不到，就以 `MISSING_CREDENTIAL` 失败，并点名该路由与该引用。启动时的凭据探测被删除：它可能在凭据服务挂载之前就运行，并把每一种失败都报成密钥缺失，而第一次请求本就会给出准确的错误。
 
 **路由替换是注册表的操作，不是调用方的一串步骤。**`registerAdapter` 返回一个携带 `replace(providers)` 的句柄：候选集合先被完整校验（冲突、名称、提供方元数据），再在一个同步区段内完成替换。被拒绝的替换会让先前的路由保持注册并继续服务，而调用方的事实缓存只有在注册表确实持有新集合之后才会推进，因此改回可用配置时会重新生效。pi-ai 的注册事实按提供方排序，因此仅仅调换键顺序的设置文档不再算作路由变更。
 
-**已提交的凭据写入采用收容式发布。**`CredentialProvider.notifyUpdated` 逐个监听器扇出 `credentials/reference-updated`；同步抛错与异步 rejection 都只记日志，不改变已提交操作的结果，而带 `INVARIANT` 代码的失败会在每个监听器都运行完之后重抛——与 settings seam 处理 `settings/updated` 的形状相同。`SettingsProvider.installSection()` 的清理会区分它的两个触发来源：提供方脱离时仍回退到组合的 entry 配置并重新推导，而消费方自身卸载时立即返回，不在拆卸过程中重新注册路由。
+**已提交的凭据写入采用收容式发布。**`CredentialProvider.notifyUpdated` 逐个监听器扇出 `credentials/reference-updated`；同步抛错与异步 rejection 都只记日志，不改变已提交操作的结果。`SettingsProvider.installSection()` 的清理会区分它的两个触发来源：提供方脱离时仍回退到组合的 entry 配置并重新推导，而消费方自身卸载时立即返回，不在拆卸过程中重新注册路由。
 
 ## 曾考虑的替代方案
 

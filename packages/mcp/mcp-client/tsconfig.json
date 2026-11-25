@@ -8,6 +8,9 @@
     "src"
   ],
   "references": [
+    { "path": "../../credentials/authorization" },
+    { "path": "../../host/webserver" },
+    { "path": "../../util/brand" },
     {
       "path": "../../../vendor/cosmokit"
     },
@@ -19,6 +22,9 @@
     },
     {
       "path": "../../llm/llm"
+    },
+    {
+      "path": "../../util/error"
     },
     {
       "path": "../../core/tools"
@@ -34,6 +40,24 @@
     },
     {
       "path": "../../util/http-proxy"
+    },
+    {
+      "path": "../mcp-resources"
+    },
+    {
+      "path": "../../core/system-prompt"
+    },
+    {
+      "path": "../../credentials/credentials"
+    },
+    {
+      "path": "../../util/values"
+    },
+    {
+      "path": "../../core/agent"
+    },
+    {
+      "path": "../../util/output-retention"
     }
   ]
 }

@@ -15,6 +15,7 @@
     { "path": "../gateway/tsconfig.client.json" },
     { "path": "../../attachment/attachment" },
     { "path": "../../client/connection/tsconfig.client.json" },
+    { "path": "../../client/file-upload/tsconfig.client.json" },
     { "path": "../../client/store" },
     { "path": "../../context/file-reference" },
     { "path": "../../core/session" },
@@ -22,11 +23,13 @@
     { "path": "../../llm/llm" },
     { "path": "../../session/session-projection" },
     { "path": "../../session/session-title" },
+    { "path": "../../session-query/session-query" },
     { "path": "../../subagent/subagent" },
     { "path": "../../util/brand" },
     { "path": "../../util/crypto" },
     { "path": "../../util/workspace-path" },
     { "path": "../../workspace/workspace" },
-    { "path": "../../typert/protocol" }
+    { "path": "../../typert/protocol" },
+    { "path": "../../util/native-command" }
   ]
 }

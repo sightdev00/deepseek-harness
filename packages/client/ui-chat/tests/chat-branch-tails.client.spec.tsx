@@ -3,11 +3,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { bindSnapshotSelector, makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
+import type { PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import type {
   ChatConversationViewNode, ConversationNode,
 } from '@deepseek-ai/dsh-client-ui-chat/client'
-import type { ChatNodeViewProps } from '../src/client/contract/slots.ts'
+import type { ChatNodeViewProps, UserContentInput } from '../src/client/contract/slots.ts'
 import {
   formatMessageClock, msUntilNextLocalMidnight, startOfLocalDay,
 } from '../src/client/chat/message-chrome.ts'
@@ -15,19 +16,16 @@ import {
   CompactionNodeView, ContextMessageNodeView, RetryNodeView, UnknownNodeView,
   UserMessageNodeView,
 } from '../src/client/chat/MessageItem.tsx'
-import { AssistantMarkdown, type AssistantMarkdownProps } from '../src/client/chat/AssistantMarkdown.tsx'
-import { StatsLine } from '../src/client/chat/StatsLine.tsx'
+import { AssistantMarkdown } from '../src/client/chat/AssistantMarkdown.tsx'
+import { useDetailedPresentation } from './presentation-fixture.client.ts'
+import { unusedImageLoader } from './reasoning-component-fixture.tsx'
+import { createUserContentFixture } from './user-content-component-fixture.tsx'
+import { useDisclosure } from '../src/client/chat/use-disclosure.ts'
+import { useSearchableHidden } from '../src/client/chat/searchable-hidden.ts'
+import { ActivityPill, UsagePill, type StatPillProps } from '../src/client/chat/StatsPills.tsx'
 import { zh } from '../src/client/locale.ts'
 import { chatSnapshotFixture } from './chat-snapshot-fixture.client.ts'
 
-/** jsdom has no ResizeObserver; StatsLine watches its row for ellipsis truncation through one. */
-class ResizeObserverStub {
-  observe(): void {}
-  unobserve(): void {}
-  disconnect(): void {}
-}
-
-beforeEach(() => { vi.stubGlobal('ResizeObserver', ResizeObserverStub) })
 afterEach(() => {
   cleanup()
   vi.useRealTimers()
@@ -35,7 +33,14 @@ afterEach(() => {
 })
 
 const t: ChatNodeViewProps['t'] = makeTranslate(zh, commonZh)
-const renderMessageImages: AssistantMarkdownProps['renderMessageImages'] = () => null
+const renderUserImages: Parameters<ReturnType<typeof createUserContentFixture>>[1] = () => null
+const userSlots: PropsRenderSlots<'conversation.chat.user.before'> = {
+  renderSlot: () => null,
+  renderSlotChain: (_key, _owner, opts) => opts?.fallback ?? null,
+  SessionProvider: ({ children }) => <>{children}</>,
+}
+let renderUserContent: ReturnType<typeof createUserContentFixture>
+beforeEach(() => { renderUserContent = createUserContentFixture() })
 const RETRY_ID = 'retry-fixture' as Extract<ConversationNode, { kind: 'model-retry' }>['retryId']
 
 // Recency scans the whole transcript; a detached fixture is its own latest row.
@@ -47,11 +52,13 @@ const useDetachedChat: ChatNodeViewProps['useChat'] = bindSnapshotSelector({
 interface MessageItemProps {
   readonly node: ConversationNode
   readonly t: ChatNodeViewProps['t']
+  readonly openCompaction?: React.ComponentProps<typeof CompactionNodeView>['openCompaction']
   readonly referenceLabels?: readonly string[]
+  readonly skillNames?: readonly string[]
 }
 
 /** Legacy-node fixture adapter for the independently registered renderers. */
-function MessageItem({ node, t: translate, referenceLabels }: MessageItemProps) {
+function MessageItem({ node, t: translate, openCompaction, referenceLabels, skillNames }: MessageItemProps) {
   const kind = node.kind === 'assistant' ? 'assistant-step' : node.kind
   const viewNode: ChatConversationViewNode = {
     key: `fixture:${node.kind}:${node.seq}`,
@@ -63,19 +70,32 @@ function MessageItem({ node, t: translate, referenceLabels }: MessageItemProps) 
     visibility: 'visible',
     data: node.kind === 'model-retry'
       ? { attempts: [node], current: node }
-      : (node.kind === 'user' || node.kind === 'steering') && referenceLabels !== undefined
-        ? { ...node, referenceLabels }
+      : (node.kind === 'user' || node.kind === 'steering') && (referenceLabels !== undefined || skillNames !== undefined)
+        ? {
+          ...node,
+          ...(referenceLabels === undefined ? {} : { referenceLabels }),
+          ...(skillNames === undefined ? {} : { skillNames }),
+        }
         : node,
   }
-  const props = { node: viewNode, t: translate, renderMessageImages, useChat: useDetachedChat } as ChatNodeViewProps
+  const renderUserFactory: ChatNodeViewProps['renderFactorySlot'] = (name, input) => {
+    if (name !== 'conversation.chat.user.content') throw new Error(`Unexpected user Factory: ${name}`)
+    return renderUserContent(input as UserContentInput, renderUserImages, translate)
+  }
+  const props: Partial<Omit<ChatNodeViewProps, 'node'>> & { node: ChatConversationViewNode } = {
+    node: viewNode, t: translate, loadImage: unusedImageLoader, renderFactorySlot: renderUserFactory,
+    openFile: vi.fn(), useChat: useDetachedChat,
+  }
   switch (node.kind) {
     case 'user':
+      return <UserMessageNodeView {...props as ChatNodeViewProps<'user'>} {...userSlots} />
     case 'steering':
-      return <UserMessageNodeView {...props as ChatNodeViewProps<'user' | 'steering'>} />
+      return <UserMessageNodeView {...props as ChatNodeViewProps<'steering'>} renderSlotChain={() => null} />
     case 'context':
       return <ContextMessageNodeView {...props as ChatNodeViewProps<'context'>} />
     case 'compaction':
-      return <CompactionNodeView {...props as ChatNodeViewProps<'compaction'>} />
+      return <CompactionNodeView {...props as ChatNodeViewProps<'compaction'>}
+        openCompaction={openCompaction ?? vi.fn()} useCompactionPreview={select => select(openCompaction !== undefined)} />
     case 'model-retry':
       return <RetryNodeView {...props as ChatNodeViewProps<'model-retry'>} />
     case 'unknown':
@@ -141,6 +161,22 @@ describe('MessageItem arms', () => {
     expect(view.container.textContent).toContain('README.md, please.')
   })
 
+  it('decorates a slash token as a skill chip only when the step resolved that skill', () => {
+    const message = {
+      kind: 'user' as const,
+      seq: 1,
+      time: 1_000,
+      content: [{ type: 'text', text: '/123 then /demo-skill go' }] as never,
+      source: null,
+    }
+    const plain = render(<MessageItem t={t} node={message} />)
+    expect(plain.container.querySelectorAll('[data-ref-chip]').length).toBe(0)
+    const resolved = render(<MessageItem t={t} node={message} skillNames={['demo-skill']} />)
+    const chips = [...resolved.container.querySelectorAll('[data-ref-chip="skill"]')]
+    expect(chips.map(chip => chip.textContent)).toEqual(['/demo-skill'])
+    expect(resolved.container.textContent).toContain('/123 then ')
+  })
+
   it('user bubbles expose clock / copy and neither branch nor edit; copy writes the text', () => {
     const writeText = vi.fn().mockResolvedValue(undefined)
     Object.defineProperty(navigator, 'clipboard', {
@@ -150,16 +186,21 @@ describe('MessageItem arms', () => {
     // Same-day clock: construct "today at 14:24" so the label stays `HH:mm`.
     const now = new Date()
     const time = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 14, 24).getTime()
-    render(
+    const view = render(
       <MessageItem t={t} node={{
         kind: 'user', seq: 1, time,
-        content: [{ type: 'text', text: 'hello bubble' }] as never,
+        content: [{ type: 'text', text: 'hello ' }, { type: 'text', text: 'bubble' }],
         source: null,
       }}
       />,
     )
     expect(screen.getByText('14:24')).toBeTruthy()
     expect(screen.getByRole('button', { name: '复制' })).toBeTruthy()
+    const stack = view.getByText('hello bubble').closest('div')?.parentElement
+    expect(stack?.parentElement).toBe(view.container.firstElementChild)
+    expect(stack?.contains(screen.getByText('14:24'))).toBe(false)
+    expect(stack?.contains(screen.getByRole('button', { name: '复制' }))).toBe(false)
+    expect(stack?.nextElementSibling?.contains(screen.getByRole('button', { name: '复制' }))).toBe(true)
     expect(screen.queryByRole('button', { name: '在新对话中分支' })).toBeNull()
     expect(screen.queryByRole('button', { name: '编辑' })).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '复制' }))
@@ -188,11 +229,32 @@ describe('MessageItem arms', () => {
     expect(exec).toHaveBeenCalledWith('copy')
   })
 
+  it('user copy succeeds through execCommand when the host refuses the async write', async () => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: vi.fn().mockRejectedValue(new Error('denied')) },
+    })
+    const exec = vi.fn().mockReturnValue(true)
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: exec })
+    render(
+      <MessageItem t={t} node={{
+        kind: 'user', seq: 1, time: 1_000,
+        content: [{ type: 'text', text: 'refused body' }] as never,
+        source: null,
+      }}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: '复制' }))
+    expect(await screen.findByRole('button', { name: '复制成功' })).toBeTruthy()
+    expect(exec).toHaveBeenCalledWith('copy')
+  })
+
   it('user copy never claims success when the host rejects the write', async () => {
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: { writeText: vi.fn().mockRejectedValue(new Error('denied')) },
     })
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: vi.fn(() => false) })
     render(
       <MessageItem t={t} node={{
         kind: 'user', seq: 1, time: 1_000,
@@ -316,8 +378,8 @@ describe('MessageItem arms', () => {
         kind: 'context',
         seq: 3,
         content: [{ type: 'text', text: 'line one\n\nline two' }],
-        source: { kind: 'plugin', plugin: 'fixture', empty: {}, list: [] },
-        provenance: { role: 'inject', label: 'fixture' },
+        source: { kind: 'fixture', empty: {}, list: [] },
+        producer: { role: 'inject', label: 'fixture' },
         form: null,
       } as never}
       />,
@@ -336,7 +398,7 @@ describe('MessageItem arms', () => {
     expect(ctxView.container.querySelector('[data-context-text]')?.textContent)
       .toBe('line one\n\nline two')
     const fields = [...ctxView.container.querySelectorAll('[data-context-fields] dt')].map(node => node.textContent)
-    expect(fields).toEqual(['plugin', 'empty', 'list'])
+    expect(fields).toEqual(['empty', 'list'])
 
     fireEvent.keyDown(disclosure, { key: ' ' })
     expect(disclosure.getAttribute('aria-expanded')).toBe('false')
@@ -358,7 +420,7 @@ describe('MessageItem arms', () => {
             { action: 'replace', scope: '.\u0000AGENTS.md', path: 'AGENTS.md' },
           ],
         },
-        provenance: { role: 'inject', label: 'AGENTS.md, sub/AGENTS.md' },
+        producer: { role: 'inject', label: 'AGENTS.md, sub/AGENTS.md' },
         form: 'instructions',
       } as never}
       />,
@@ -386,7 +448,7 @@ describe('MessageItem arms', () => {
             { action: 'replace', scope: 'b', path: 'old/AGENTS.md' },
           ],
         },
-        provenance: { role: 'inject', label: 'new/AGENTS.md, old/AGENTS.md' },
+        producer: { role: 'inject', label: 'new/AGENTS.md, old/AGENTS.md' },
         form: 'instructions',
       } as never}
       />,
@@ -407,7 +469,7 @@ describe('MessageItem arms', () => {
           { type: 'text', text: 'after' },
         ],
         source: null,
-        provenance: { role: 'inject', label: null },
+        producer: { role: 'inject', label: null },
         form: null,
       } as never}
       />,
@@ -429,7 +491,7 @@ describe('MessageItem arms', () => {
           form: 'catalog',
           entries: [{ name: 'a-skill', description: 'Does A' }, { name: 'b-skill', description: 'Does B' }],
         },
-        provenance: { role: 'inject', label: 'skill-catalog' },
+        producer: { role: 'inject', label: 'skill-catalog' },
         form: 'catalog',
       } as never}
       />,
@@ -453,7 +515,7 @@ describe('MessageItem arms', () => {
           update: true,
           entries: [{ name: 'a-skill', description: 'Does A' }],
         },
-        provenance: { role: 'inject', label: 'skill-catalog' },
+        producer: { role: 'inject', label: 'skill-catalog' },
         form: 'catalog',
       } as never}
       />,
@@ -475,7 +537,7 @@ describe('MessageItem arms', () => {
           form: 'catalog',
           entries: [{ name: 'a-skill', description: 'Does A' }, { name: 'b-skill' }],
         },
-        provenance: { role: 'inject', label: 'skill-catalog' },
+        producer: { role: 'inject', label: 'skill-catalog' },
         form: 'catalog',
       } as never}
       />,
@@ -495,7 +557,7 @@ describe('MessageItem arms', () => {
         seq: 3,
         content: [{ type: 'text', text: 'instruction prose' }],
         source: { kind: 'agent-instructions', form: 'instructions', changes: [{ action: 'set' }] },
-        provenance: { role: 'inject', label: 'agent-instructions' },
+        producer: { role: 'inject', label: 'agent-instructions' },
         form: 'instructions',
       } as never}
       />,
@@ -515,7 +577,7 @@ describe('MessageItem arms', () => {
         seq: 3,
         content: [{ type: 'text', text: 'first' }, { type: 'text', text: 'second' }],
         source: null,
-        provenance: { role: 'inject', label: null },
+        producer: { role: 'inject', label: null },
         form: null,
       } as never}
       />,
@@ -531,7 +593,7 @@ describe('MessageItem arms', () => {
         seq: 3,
         content: [{ type: 'text', text: 'short' }],
         source: { kind: 'plugin', note: 'y'.repeat(21_000) },
-        provenance: { role: 'inject', label: 'plugin' },
+        producer: { role: 'inject', label: 'plugin' },
         form: null,
       } as never}
       />,
@@ -550,7 +612,7 @@ describe('MessageItem arms', () => {
         seq: 3,
         content: [{ type: 'text', text: 'catalog prose' }],
         source: { kind: 'skill-catalog', form: 'catalog', update: true, entries: [] },
-        provenance: { role: 'inject', label: 'skill-catalog' },
+        producer: { role: 'inject', label: 'skill-catalog' },
         form: 'catalog',
       } as never}
       />,
@@ -569,7 +631,7 @@ describe('MessageItem arms', () => {
         seq: 3,
         content: [{ type: 'text', text: 'catalog prose' }],
         source: { kind: 'skill-catalog', form: 'catalog', entries: 'not-a-list' },
-        provenance: { role: 'inject', label: 'skill-catalog' },
+        producer: { role: 'inject', label: 'skill-catalog' },
         form: 'catalog',
       } as never}
       />,
@@ -585,7 +647,7 @@ describe('MessageItem arms', () => {
       <MessageItem t={t} node={{
         kind: 'context', seq: 3, content: [{ type: 'text', text: 'catalog prose' }],
         source: { kind: 'skill-catalog', form: 'catalog', entries },
-        provenance: { role: 'inject', label: 'skill-catalog' },
+        producer: { role: 'inject', label: 'skill-catalog' },
         form: 'catalog',
       } as never}
       />,
@@ -602,7 +664,7 @@ describe('MessageItem arms', () => {
         seq: 3,
         content: [{ type: 'text', text: 'prose' }, { type: 'future-block', payload: 1 }],
         source: { kind: 'skill-catalog', form: 'catalog', entries: [{ name: 'a', description: 'b' }] },
-        provenance: { role: 'inject', label: 'skill-catalog' },
+        producer: { role: 'inject', label: 'skill-catalog' },
         form: 'catalog',
       } as never}
       />,
@@ -620,7 +682,7 @@ describe('MessageItem arms', () => {
         seq: 3,
         content: [{ type: 'text', text: 'instruction prose' }],
         source: { kind: 'agent-instructions', form: 'instructions', changes: [{ action: 'merge', path: 'A.md' }] },
-        provenance: { role: 'inject', label: 'agent-instructions' },
+        producer: { role: 'inject', label: 'agent-instructions' },
         form: 'instructions',
       } as never}
       />,
@@ -635,15 +697,15 @@ describe('MessageItem arms', () => {
     const view = render(
       <MessageItem t={t} node={{
         kind: 'context', seq: 3, content: [{ type: 'text', text: 'x' }],
-        source: { kind: 'plugin', plugin: 'later', form: 'a-later-form' },
-        provenance: { role: 'inject', label: 'later' },
+        source: { kind: 'later', form: 'a-later-form' },
+        producer: { role: 'inject', label: 'later' },
         form: null,
       } as never}
       />,
     )
     fireEvent.click(view.getByRole('button', { name: /^上下文注入\s*later$/ }))
     const fields = [...view.container.querySelectorAll('[data-context-fields] dt')].map(node => node.textContent)
-    expect(fields).toEqual(['plugin', 'form'])
+    expect(fields).toEqual(['form'])
   })
 
   it('the snapshot form attributes each part to the subsystem that produced it', () => {
@@ -653,12 +715,11 @@ describe('MessageItem arms', () => {
         seq: 3,
         content: [{ type: 'text', text: 'Current runtime context.\n\nsandbox\n\nworkspace' }],
         source: {
-          kind: 'plugin',
-          plugin: '@deepseek-ai/dsh-system-prompt',
+          kind: 'runtime-context',
           form: 'snapshot',
           sections: [{ name: 'sandbox:policy', text: 'workspace-write' }, { name: 'workspace', text: '/repo' }],
         },
-        provenance: { role: 'inject', label: '@deepseek-ai/dsh-system-prompt' },
+        producer: { role: 'inject', label: '@deepseek-ai/dsh-system-prompt' },
         form: 'snapshot',
       } as never}
       />,
@@ -675,8 +736,8 @@ describe('MessageItem arms', () => {
         kind: 'context',
         seq: 3,
         content: [{ type: 'text', text: 'background job bash-1 finished.' }],
-        source: { kind: 'plugin', plugin: 'tool-jobs', form: 'notice', summary: 'bash pnpm test [status: completed]' },
-        provenance: { role: 'inject', label: 'tool-jobs' },
+        source: { kind: 'tool-jobs', form: 'notice', summary: 'bash pnpm test [status: completed]' },
+        producer: { role: 'inject', label: 'tool-jobs' },
         form: 'notice',
       } as never}
       />,
@@ -690,8 +751,8 @@ describe('MessageItem arms', () => {
     const view = render(
       <MessageItem t={t} node={{
         kind: 'context', seq: 3, content: [{ type: 'text', text: 'notice prose' }],
-        source: { kind: 'plugin', plugin: 'tool-jobs', form: 'notice' },
-        provenance: { role: 'inject', label: 'tool-jobs' },
+        source: { kind: 'tool-jobs', form: 'notice' },
+        producer: { role: 'inject', label: 'tool-jobs' },
         form: 'notice',
       } as never}
       />,
@@ -714,7 +775,7 @@ describe('MessageItem arms', () => {
       const view = render(
         <MessageItem t={t} node={{
           kind: 'context', seq: 3, content: [{ type: 'text', text: `${form} prose` }],
-          source, provenance: { role: 'inject', label }, form,
+          source, producer: { role: 'inject', label }, form,
         } as never}
         />,
       )
@@ -730,7 +791,7 @@ describe('MessageItem arms', () => {
       <MessageItem t={t} node={{
         kind: 'context', seq: 3, content: [{ type: 'text', text: 'Current runtime context.' }],
         source: { kind: 'plugin', form: 'snapshot', sections: [{ name: 'sandbox', text: 'w' }] },
-        provenance: { role: 'inject', label: 'plugin' },
+        producer: { role: 'inject', label: 'plugin' },
         form: 'snapshot',
       } as never}
       />,
@@ -740,6 +801,23 @@ describe('MessageItem arms', () => {
       .toBe('取代先前的快照')
   })
 
+  it('an empty runtime snapshot keeps the cleared reminder visible', () => {
+    const text = '<system-reminder>\nCurrent runtime context: none. Earlier runtime-context snapshots no longer apply.\n</system-reminder>'
+    const view = render(
+      <MessageItem t={t} node={{
+        kind: 'context', seq: 3, content: [{ type: 'text', text }],
+        source: { kind: 'runtime-context', form: 'snapshot', sections: [] },
+        producer: { role: 'inject', label: 'runtime-context' },
+        form: 'snapshot',
+      } as never}
+      />,
+    )
+    fireEvent.click(view.getByRole('button', { name: /^上下文注入\s*runtime-context$/ }))
+    expect(view.container.querySelector('[data-context-text]')?.textContent).toBe(text)
+    expect(view.container.querySelector('[data-context-sections]')).toBeNull()
+    expect(view.queryByText('取代先前的快照')).toBeNull()
+  })
+
   it('a relay names the agent that sent it above what it said', () => {
     const view = render(
       <MessageItem t={t} node={{
@@ -747,7 +825,7 @@ describe('MessageItem arms', () => {
         seq: 3,
         content: [{ type: 'text', text: 'child report body' }],
         source: { kind: 'agent-message', form: 'relay', senderSessionId: 'child-7' },
-        provenance: { role: 'inject', label: 'agent-message' },
+        producer: { role: 'inject', label: 'agent-message' },
         form: 'relay',
       } as never}
       />,
@@ -774,7 +852,7 @@ describe('MessageItem arms', () => {
             { label: '修 CI', retainedMessages: 3, omittedMessages: 0, truncated: false },
           ],
         },
-        provenance: { role: 'recall', label: '重构 loader, 修 CI' },
+        producer: { role: 'recall', label: '重构 loader, 修 CI' },
         form: 'recall',
       } as never}
       />,
@@ -793,39 +871,47 @@ describe('MessageItem arms', () => {
     expect(unknownView.getByText(/未知 surface 事件：surface\/next/)).toBeTruthy()
   })
 
-  it('a compaction marker discloses its summary and never shows the framed checkpoint', () => {
+  it.each([
+    [{ status: 'running' }, 'running', t('message.compaction.running')],
+    [{ status: 'interrupted' }, 'error', t('message.taskStopped')],
+    [{ status: 'ended' }, 'ok', t('command.done')],
+    [{ status: 'ended', error: 'Failure\nDetails' }, 'error', 'Failure Details'],
+  ] as const)('renders automatic compaction progress %j', (progress, state, summary) => {
+    const node = { data: { kind: 'compaction-progress', ...progress } }
+    const view = render(<CompactionNodeView {...{ node, t } as ChatNodeViewProps<'compaction'>}
+      useCompactionPreview={select => select(false)} openCompaction={vi.fn()} />)
+    expect(view.container.querySelector(`[data-state="${state}"]`)).toBeTruthy()
+    expect(view.getByText(summary)).toBeTruthy()
+  })
+
+  it('a compaction marker opens its summary seq in the Sidebar and never shows the framed checkpoint', () => {
+    const openCompaction = vi.fn<(seq: number, signal: AbortSignal) => Promise<string | null>>(async () => null)
     const view = render(
-      <MessageItem t={t} node={{
-        kind: 'compaction', seq: 5, time: 1_000,
-        summary: '## 摘要标题\n\n保留的事实。',
-        summaryEventSeq: 4,
+      <MessageItem t={t} openCompaction={openCompaction} node={{
+        kind: 'compaction', seq: 5, summaryEventSeq: 4, time: 1_000,
         shadowedItemCount: 16,
         shadowedTokenCount: 11_309,
       }}
       />,
     )
-    const row = view.getByRole('button', { name: /上下文已压缩/ })
-    expect(row.getAttribute('aria-expanded')).toBe('false')
+    const row = view.getByRole('button', { name: /上下文已压缩.*在侧栏查看压缩摘要/ })
+    expect(row).toHaveProperty('disabled', false)
+    expect(row.getAttribute('aria-expanded')).toBeNull()
     expect(view.getByText('已压缩 16 条历史记录（约 11309 tokens）')).toBeTruthy()
-    expect(view.queryByText(/保留的事实/)).toBeNull()
     fireEvent.click(row)
-    expect(row.getAttribute('aria-expanded')).toBe('true')
-    expect(view.getByRole('heading', { name: '摘要标题' })).toBeTruthy()
-    fireEvent.click(row)
-    expect(row.getAttribute('aria-expanded')).toBe('false')
+    expect(openCompaction).toHaveBeenCalledExactlyOnceWith(4, expect.any(AbortSignal))
+    expect(view.container.querySelector('[class*="compactionBody"]')).toBeNull()
   })
 
-  it('a marker whose cited summary event fell outside the window is not expandable', () => {
+  it('a marker without a Sidebar opener is disabled and keeps neutral copy without counts', () => {
     const view = render(<MessageItem t={t} node={{
-      kind: 'compaction', seq: 6, time: 1_000, summary: null,
-      summaryEventSeq: null, shadowedItemCount: null, shadowedTokenCount: null,
+      kind: 'compaction', seq: 6, summaryEventSeq: 5, time: 1_000, shadowedItemCount: null, shadowedTokenCount: null,
     }} />)
     const row = view.getByRole('button', { name: /上下文已压缩/ })
     expect(row).toHaveProperty('disabled', true)
-    expect(row.getAttribute('aria-expanded')).toBeNull()
-    expect(view.getByText('压缩摘要不可用')).toBeTruthy()
-    fireEvent.click(row) // a disabled control stays collapsed
-    expect(row.getAttribute('aria-expanded')).toBeNull()
+    expect(view.getByText('较早的历史已压缩为摘要')).toBeTruthy()
+    expect(view.queryByText('在侧栏查看压缩摘要')).toBeNull()
+    fireEvent.click(row)
   })
 
   it('collapses retry details behind the durable model retry status', () => {
@@ -1011,17 +1097,18 @@ describe('useCalendarDay boundary refresh', () => {
 describe('small branch tails', () => {
   it('AssistantMarkdown single-line reasoning summary skips the newline cut', () => {
     const view = render(
-      <AssistantMarkdown
+      <AssistantMarkdown renderSlot={() => null} useDisclosure={useDisclosure} useGroupAction={useSearchableHidden}
+        usePresentation={useDetailedPresentation}
         t={t}
         blocks={[{ kind: 'reasoning', text: 'one-liner' }]}
         streaming={false}
-        renderMessageImages={renderMessageImages}
+        loadImage={unusedImageLoader}
       />,
     )
     expect(view.getByText('one-liner')).toBeTruthy()
   })
 
-  it('StatsLine omits the cache-hit segment when no input accounting exists at all', () => {
+  it('composer stats omit the cache-hit segment when no input accounting exists at all', () => {
     // Cache hit is null only when all three prompt buckets are zero (pure
     // output accounting) — any billed input makes it a real 0%.
     const nodes = [{
@@ -1029,15 +1116,58 @@ describe('small branch tails', () => {
     }] as const
     const snap = chatSnapshotFixture({ nodes })
     const source = { getSnapshot: () => snap, subscribe: () => () => {} }
+    const pillProps: StatPillProps = {
+      usePerformanceUsage: selector => selector('detailed'),
+      t,
+      useChat: bindSnapshotSelector(source),
+      useProjection: (key: string) => key === 'tokenUsage'
+        ? { uncachedInputTokens: 0, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0 }
+        : undefined,
+    }
     const view = render(
-      <StatsLine
+      <>
+        <ActivityPill {...pillProps} />
+        <UsagePill {...pillProps} />
+      </>,
+    )
+    // The untimed counts pill renders static, so the usage pill is the only button.
+    const [usagePill] = [...view.getAllByRole('button')] as [HTMLElement]
+    expect(view.getByText('1 轮 1 步').closest('button')).toBeNull()
+    expect(usagePill.textContent).toBe('10 tok')
+    // Pure output accounting still reaches the usage pill's click-open dialog rows.
+    fireEvent.click(usagePill)
+    const dialog = view.getByRole('dialog')
+    expect(dialog.textContent).toContain('输出10 tok')
+    expect(dialog.textContent).not.toContain('缓存命中')
+  })
+})
+
+describe('user file attachments', () => {
+  it('renders one card per durable file block with its name and compact size', () => {
+    const view = render(
+      <MessageItem
         t={t}
-        useChat={bindSnapshotSelector(source)}
-        useProjection={(key: string) => key === 'tokenUsage'
-          ? { uncachedInputTokens: 0, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0 }
-          : undefined}
+        node={{
+          kind: 'user',
+          seq: 1,
+          time: 1_000,
+          content: [
+            { type: 'file', attachment: { attachmentId: 'sha256:cd', name: 'notes.pdf', bytes: 3 * 1024 * 1024 + 200 * 1024 } },
+            { type: 'file', attachment: { attachmentId: 'sha256:ef', name: 'tiny.txt', bytes: 12 } },
+            { type: 'file', attachment: { attachmentId: 'sha256:aa', name: 'mid.csv', bytes: 500 * 1024 } },
+            { type: 'text', text: 'summarize these' },
+          ] as never,
+          source: null,
+        }}
       />,
     )
-    expect(view.container.textContent).toBe('1 轮 · 1 步| 输入 0 tok · 输出 10 tok')
+    expect(view.getByTitle('notes.pdf').textContent).toContain('3.2MB')
+    expect(view.getByTitle('tiny.txt').textContent).toContain('12B')
+    expect(view.getByTitle('mid.csv').textContent).toContain('500KB')
+    const icons = ['notes.pdf', 'tiny.txt', 'mid.csv'].map(name =>
+      view.getByTitle(name).querySelector('svg')?.innerHTML,
+    )
+    expect(new Set(icons).size).toBe(icons.length)
+    expect(view.getByText('summarize these')).toBeTruthy()
   })
 })

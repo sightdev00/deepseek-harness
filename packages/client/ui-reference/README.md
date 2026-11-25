@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`dsh-client-ui-reference` is the unified Web `@file` and `@session` reference source: it registers the `reference` entry in the composer's inline-suggestion machinery so a user typing `@` sees file and session candidates in one list. Files order before sessions, sections are labelled with locale-registered terms, and either candidate domain can fail independently without blocking the other. Each row carries only what distinguishes it: a file names its parent directory and nothing at the workspace root, a session names its workspace only when that workspace is not the current one, and a drilled directory listing names none because its breadcrumb already does. A pick inserts an atomic inline reference — file, folder, and session alike — whose hidden serialized and clipboard form is the natural text the shared `@path` grammar defines; a directory row additionally carries a drill verb (Tab or the row's chevron) that keeps plain editable path text and the menu active at its trailing slash so the user can descend another level. Selecting a session routes through the session-reference service, which validates the mention and captures model context at the pre-step boundary; this package itself registers no prompt or tool.
+Use `dsh-client-ui-reference` when Web users need to mention files, folders, or sessions from one `@` completion menu. It lists files before sessions and keeps either group available when the other cannot load. Picking a file, folder, or session inserts an atomic reference with a stable clipboard form; folder rows also let users descend without closing completion. File rows omit redundant root locations, and session rows show a workspace only when it differs from the current one. Session mentions are validated before model context is captured, while browsing candidates has no model effect.
 
 ## Table of Contents
 
@@ -29,13 +29,23 @@ The source is active whenever the composition mounts this package and a Host `ct
 
 ### What a pick inserts
 
-A file closes completion as an atomic inline reference displayed with a file glyph and business-color filename. A directory row carries two verbs: the settling pick (row click or Enter) resolves the folder itself as the same kind of atomic reference — folder glyph, trailing-slash label, canonical `@dir/` mention as its serialized form — while the drill action (Tab or the row's chevron) keeps plain editable path text with a folder glyph and the menu active at its trailing slash, so you can descend another level. Paths containing whitespace use `@"path with spaces"`, and a quote the user opened explicitly remains quoted.
+A file closes completion as an atomic inline reference displayed with a file glyph and business-color filename. A directory row carries two verbs: the settling pick (row click or Enter) resolves the folder itself as the same kind of atomic reference — folder glyph, trailing-slash label, canonical `@dir/` mention as its serialized form — while the drill action (Tab or the row's chevron) keeps plain editable path text with a folder glyph and the menu active at its trailing slash, so you can descend another level. A settled file or folder reference carries the absolute path, the listed path joined to the Session's current working directory, so the sent text names the same file after that directory changes; drill text stays relative to it. The reference keeps the listed spelling when the Session's directory is unknown or the absolute path cannot be written as a mention. Paths containing whitespace use `@"path with spaces"`, and a quote the user opened explicitly remains quoted.
 
 A session pick inserts an atomic inline reference whose hidden `ref` and clipboard representation is the canonical `@[label](dsh-session:…)` mention returned by the Host; its visible form is a chat-bubble glyph plus the session title. Sending carries the mention through `session.prompt`, and the session-reference service validates it and captures model context at `agent/pre-step`.
+
+The shared file context menu ends with **Add to chat**. It inserts the clicked file as the same kind of reference into that Session’s draft, preserves existing text and selection, and returns focus without sending. The reference captures the resolved absolute path; line numbers are not included. The action is disabled when the Session cannot be edited at the moment the menu opens or the path cannot use the mention grammar; a draft that becomes uneditable while the menu stays open makes the action report failure instead of inserting. An open menu updates its label and failure feedback when the interface language changes.
+
+### Sent file and folder mentions
+
+In sent messages, queued rows, and local echoes, an `@path` or `@"path"` token renders as a file or folder reference only after the Session's filesystem confirms the path exists. Until then, and for a path that does not exist, such as a hand-typed `@notes`, the original text stays verbatim; email addresses never match. A candidate picked and sent in the same Session during one page load counts as confirmed, so its echo shows the reference immediately.
 
 ### Failure behavior
 
 One unavailable or failed candidate domain yields no rows for that domain while the other still lists. A session-reference preparation failure occurs after prompt acceptance and terminates that agent turn.
+
+Click a file reference in the composer to preview its current contents in the right Sidebar. Quoted paths retain their spaces, and paths resolve in the composer Session. Folder and Session references retain their editing behavior.
+
+Interactive file chips obtain `useContextMenu` from their Session Slot and receive path resolution through the file-reference registration. Paths resolve against the live workspace root when the gesture begins; the Session’s working directory does not change reference meaning. Display-only chips install no context-menu handlers, and no Markdown provider is needed.
 
 -----
 
@@ -49,11 +59,15 @@ The source keeps candidate encoding internal to the registration effect: the `/c
 
 ### Candidate flow
 
-For an unquoted token, the browser starts the `fileReferences/list` and `sessionReferenceResolver/candidates` Remote calls together, then deterministically orders files before sessions with locale-registered folder/file/session labels. Rows render under non-selectable file and session section headings without a redundant raw `reference` source title. A session row is dated from the Host session list's `updatedAt` through the same relative-time bucket that list uses, so one session reads the same age on both surfaces; a session the list does not carry falls back to the candidate's creation time. A drilled query publishes a breadcrumb from the workspace root to the directory being listed; each crumb carries the drill payload a folder row would, so returning to a step and descending into one are one outcome.
+For an unquoted token, the browser starts the `fileReferences/list` and `sessionReferenceResolver/candidates` Remote calls together, then deterministically orders files, direct subagents of the current Session, and other Sessions. Rows use the resolver's display title, which prefers a subagent's creation label while ordinary Sessions retain their projected title, and render under locale-owned group headings without a redundant raw `reference` source title. A session row is dated from the Host session list's `updatedAt` through the same relative-time bucket that list uses, so one session reads the same age on both surfaces; a session the list does not carry falls back to the candidate's creation time. A drilled query publishes a breadcrumb from the workspace root to the current directory; each crumb carries the drill payload a folder row would, so returning to a step and descending into one are one outcome.
+
+Candidate requests require an existing retained Client Session and share one temporary `referenceCandidates` reference. Both discovery calls wait for that Session's initial history open to succeed; an unretained Session or failed open prevents both RPCs. The candidate request's cancellation signal covers the history wait and both calls, and the temporary reference is released when the lookup settles.
 
 ### Serialization
 
-File picks preserve the natural text defined by the shared `@path` grammar as the hidden serialized and clipboard form. Session picks use the canonical `@[label](dsh-session:…)` mention; serialization never reconstructs identity from the visible title.
+File picks preserve the natural text defined by the shared `@path` grammar, with the absolute path, as the hidden serialized and clipboard form. Session picks use the canonical `@[label](dsh-session:…)` mention; serialization never reconstructs identity from the visible title.
+
+The plugin also registers file and folder matchers with [UserText](../ui-conversation/README.md#sent-user-text) and owns their `conversation.user.text.node` renderers. Each query returns the next complete candidate reference at an original-text offset without file discovery; the shared evaluator resolves overlaps by source position. Both node renderers subscribe to a Session-bound `pathPresence` keyed Hook backed by `workspaceFiles/stat`: a stat result or a `workspace-file/not-regular-file` failure (a directory, a symbolic link whatever it points to, or another non-regular entry) confirms the path, `workspace-file/not-found` rejects it, and any other failure leaves it unconfirmed for the next subscriber to retry. The plugin owns these answers, keeps one per Session and path, and aborts outstanding stats on disposal; a settling pick records its path as confirmed. Presence does not read the [`file` resource](../../api/workspace-files/README.md) through `useResource`: that provider keeps one Host change subscription open per Session and path while a reader is mounted, and a mention needs a single answer. Interactive file nodes also receive a Session-bound `openFile` injection; navigation failures keep the reference visible and offer a local retry/close dialog. Folder nodes remain labels.
 
 </details>
 
@@ -67,7 +81,7 @@ These pages cover the suggestion machinery, the reference seams, and the input p
 - [ui-input-trigger](../ui-input-trigger/README.md) — the inline suggestion machinery the source registers into.
 - [file-reference](../../context/file-reference/README.md) — the `@file` seam and its provider contract.
 - [session-reference](../../context/session-reference/README.md) — the `@session` seam and prepared snapshot semantics.
-- [Web input machine and slash pipeline](../../../.agents/notes/implemented/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md) — how references and commands share the input machine.
+- [Web input machine and slash pipeline](../../../.agents/notes/archived/architecture/2026-07-25-web-input-machine-and-slash-pipeline.md) — how references and commands share the input machine.
 
 -----
 
@@ -89,6 +103,8 @@ These limits define when the reference source cannot help; they are current pack
 
 - **Candidate failure is intentionally quiet** — one unavailable or failed Remote discovery call yields no rows for that domain. A session-reference preparation failure occurs after prompt acceptance and terminates that agent turn.
 - **No browser-side file scan** — Web completion requires a mounted Host `ctx.fileReferences` provider; the browser cannot fall back to its own filesystem.
+- **Sent references do not follow file changes** — a path's confirmed or missing answer lasts for the page load; creating or removing the path later changes how its mentions render only after reload.
+- **Hand-typed relative mentions follow the Session's directory** — an `@relative/path` typed by hand, or sent before picks carried absolute paths, is read from the Session's current working directory; after that directory changes it names another file or none.
 - **Session search remains metadata-only** — discovery filters session id, cwd, and the latest log-backed title through `ctx.sessionReferenceResolver`; message bodies and full transcripts are not searched.
 
 <a id="dev-note"></a>
@@ -100,5 +116,3 @@ These limits define when the reference source cannot help; they are current pack
 None.
 
 </details>
-
-**Runtime invariant:** No companion is published. A single slash-source registration whose disposal is proven by the HMR-safety spec — it emits no cordis events and owns no cross-plugin mutable state.

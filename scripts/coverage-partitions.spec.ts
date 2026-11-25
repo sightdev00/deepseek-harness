@@ -1,37 +1,61 @@
-import { access, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   COVERAGE_PARTITION_MODE_ENV,
   COVERAGE_PARTITIONS_ENV,
   COVERAGE_TEST_TIMEOUT_ENV,
   CoveragePartitionCoordinator,
+  COVERAGE_SHARD_DIRECTORY,
   assignWeightedPartitions,
   collectPartitionDurations,
-  coverageTestTimeoutArgs,
+  FailedTestCollector,
+  mergeCoverageShards,
+  parseCoverageShard,
+  selectCoverageShardFiles,
+  coverageTestTimeoutOptions,
   forwardedCoverageArgs,
   parseCoveragePartitionCount,
-  parseListOutput,
+  parseCoverageTestTimeout,
+  parseFileInventory,
   readFileDurations,
   writeFileDurations,
   type CoverageCommand,
   type CoverageCommandResult,
   type CoveragePartitionCoordinatorOptions,
 } from './coverage-partitions.ts'
+import {
+  END_OF_LINE_COLUMN,
+  canonicalizeEndOfLineColumns,
+} from './coverage-canonical-locations.ts'
 
 const passed: CoverageCommandResult = { exitCode: 0, signalCode: null }
 
-afterEach(() => vi.restoreAllMocks())
+/** Every temporary root created by this file, removed after each test. */
+const roots: string[] = []
+afterEach(async () => {
+  vi.restoreAllMocks()
+  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true })
+})
 
 async function writeBlob(command: CoverageCommand): Promise<void> {
   if (command.blobPath === undefined) return
   await mkdir(dirname(command.blobPath), { recursive: true })
   await writeFile(command.blobPath, '{}')
+  const configArgument = command.args.find(argument => argument.startsWith('--config='))!
+  const source = await readFile(join(command.cwd, configArgument.slice('--config='.length)), 'utf8')
+  const files = [...source.matchAll(/"([^"\n]+\.spec\.tsx?)"/g)].map(match => match[1]!)
+  const reportArgument = command.args.find(argument => argument.startsWith('--outputFile.fileTimes='))!
+  await writeFile(join(command.cwd, reportArgument.slice('--outputFile.fileTimes='.length)), JSON.stringify(files.map(file => ({ file, duration: 0 }))))
 }
 
 async function temporaryRoot(): Promise<string> {
-  return await mkdtemp(join(tmpdir(), 'dsh-coverage-partitions-'))
+  const root = await mkdtemp(join(tmpdir(), 'dsh-coverage-partitions-'))
+  roots.push(root)
+  return root
 }
 
 /** Write a Vitest results cache under a temporary root. */
@@ -89,21 +113,24 @@ describe('coverage partition count', () => {
   })
 })
 
-describe('coverage partition timeout', () => {
-  it('applies one configured timeout to tests, polling, and hooks', () => {
-    expect(coverageTestTimeoutArgs('30000')).toEqual([
-      '--testTimeout=30000',
-      '--expect.poll.timeout=30000',
-      '--hookTimeout=30000',
-    ])
+describe('lane test budget', () => {
+  it('applies one configured budget to tests, hooks, and expect.poll', () => {
+    expect(coverageTestTimeoutOptions('30000')).toEqual({
+      testTimeout: 30000,
+      hookTimeout: 30000,
+      expect: { poll: { timeout: 30000 } },
+    })
   })
 
-  it('keeps Vitest defaults when the timeout is absent', () => {
-    expect(coverageTestTimeoutArgs(undefined)).toEqual([])
+  it.each([undefined, ''])('keeps Vitest defaults when the budget is %j', (raw) => {
+    expect(parseCoverageTestTimeout(raw)).toBeUndefined()
+    expect(coverageTestTimeoutOptions(raw)).toEqual({})
   })
 
-  it('rejects invalid timeout input', () => {
-    expect(() => coverageTestTimeoutArgs('0'))
+  it.each(['0', '-1', '2.5', '090', '90000ms', 'many'])('rejects %j', (raw) => {
+    expect(() => parseCoverageTestTimeout(raw))
+      .toThrow(`${COVERAGE_TEST_TIMEOUT_ENV} must be a positive integer, got ${JSON.stringify(raw)}.`)
+    expect(() => coverageTestTimeoutOptions(raw))
       .toThrow(`${COVERAGE_TEST_TIMEOUT_ENV} must be a positive integer`)
   })
 })
@@ -179,24 +206,58 @@ describe('weighted partition assignment', () => {
 })
 
 describe('coverage file inventory', () => {
-  it('parses vitest list --filesOnly output, keeps project ownership, and drops exempt suites', async () => {
+  it('keeps JSON file paths and project ownership while dropping exempt suites', async () => {
     const root = await temporaryRoot()
     const exemptDir = join(root, 'packages/experimental/webworker-runtime/tests')
     await mkdir(exemptDir, { recursive: true })
     await writeFile(join(exemptDir, 'transform-corpus.spec.ts'), '')
-    const output = [
-      '[thread-safe] packages/a/tests/a.spec.ts',
-      '[process-bound] packages/b/tests/b.spec.ts',
-      '[thread-safe] packages/experimental/webworker-runtime/tests/transform-corpus.spec.ts',
-      'not a test line',
-    ].join('\n')
-    const inventory = parseListOutput(output, root)
+    const output = JSON.stringify([
+      { projectName: 'thread-safe', file: join(root, 'packages/a/tests/a.spec.ts') },
+      { projectName: 'process-bound', file: join(root, 'packages/b/tests/with spaces.spec.ts') },
+      { projectName: 'thread-safe', file: join(exemptDir, 'transform-corpus.spec.ts') },
+    ])
+    const inventory = parseFileInventory(output, root)
     expect(inventory.files).toEqual([
       'packages/a/tests/a.spec.ts',
-      'packages/b/tests/b.spec.ts',
+      'packages/b/tests/with spaces.spec.ts',
     ])
     expect(inventory.projectOf.get('packages/a/tests/a.spec.ts')).toBe('thread-safe')
-    expect(inventory.projectOf.get('packages/b/tests/b.spec.ts')).toBe('process-bound')
+    expect(inventory.projectOf.get('packages/b/tests/with spaces.spec.ts')).toBe('process-bound')
+  })
+
+  it.each(['[', '{}', '[null]', '[{}]', '[{"file":42}]', '[{"file":"a.spec.ts","projectName":"unknown"}]'])('rejects malformed inventories instead of dropping entries: %s', async (output) => {
+    const root = await temporaryRoot()
+    expect(() => parseFileInventory(output, root)).toThrow()
+  })
+
+  it('rejects duplicate file ownership', async () => {
+    const root = await temporaryRoot()
+    const file = join(root, 'a.spec.ts')
+    expect(() => parseFileInventory(JSON.stringify([
+      { file, projectName: 'thread-safe' }, { file, projectName: 'process-bound' },
+    ]), root)).toThrow('more than once')
+  })
+
+  it('removes every Typert package from instrumented files and project assignments', async () => {
+    const root = await temporaryRoot()
+    const typertFiles = [
+      'packages/typert/generator/tests/type-model.spec.ts',
+      'packages/typert/loader/tests/loader.spec.ts',
+      'packages/typert/protocol/tests/protocol.spec.ts',
+      'packages/typert/registry/tests/typert.spec.ts',
+      'packages/typert/future/tests/nested/client.spec.tsx',
+    ]
+    for (const file of typertFiles) {
+      await mkdir(dirname(join(root, file)), { recursive: true })
+      await writeFile(join(root, file), '')
+    }
+    const retained = 'packages/api/gateway/tests/rpc.spec.ts'
+    const inventory = parseFileInventory(
+      JSON.stringify([...typertFiles, retained].map(file => ({ projectName: 'thread-safe', file: join(root, file) }))),
+      root,
+    )
+    expect(inventory.files).toEqual([retained])
+    expect([...inventory.projectOf]).toEqual([[retained, 'thread-safe']])
   })
 
   it('averages recorded durations per file from the results cache', async () => {
@@ -230,21 +291,206 @@ describe('coverage file inventory', () => {
     expect(durations.get('packages/a/tests/y.spec.ts')).toBe(7)
   })
 
-  it('extracts per-file durations from partition json reports', async () => {
+  it('extracts per-file durations from compact partition timing reports', async () => {
     const root = await temporaryRoot()
-    const report = join(root, 'partition-1.report.json')
-    await writeFile(report, JSON.stringify({
-      testResults: [
-        { name: join(root, 'packages/a/tests/x.spec.ts'), startTime: 1000, endTime: 1500 },
-        { name: 'not-a-spec', startTime: 1, endTime: 2 },
-      ],
-    }))
-    const durations = collectPartitionDurations([report], root)
+    const report = join(root, 'partition-1.times.json')
+    await writeFile(report, JSON.stringify([
+      { file: 'packages/a/tests/x.spec.ts', duration: 500 },
+      { file: 'packages/a/tests/y.spec.ts', duration: 0 },
+      { file: 'packages/a/tests/invalid.spec.ts', duration: -1 },
+      { file: 'packages/a/tests/malformed.spec.ts', duration: 'unknown' },
+      null,
+      { duration: 10 },
+    ]))
+    const durations = collectPartitionDurations([report])
     expect(durations.get('packages/a/tests/x.spec.ts')).toBe(500)
+    expect(durations.get('packages/a/tests/y.spec.ts')).toBe(0)
+    expect(durations.size).toBe(2)
+  })
+
+  it.each(['null', '{}', '42', '"invalid"', '{'])('ignores corrupt timing metadata %s', async (contents) => {
+    const root = await temporaryRoot()
+    const report = join(root, 'partition.times.json')
+    await writeFile(report, contents)
+    expect(collectPartitionDurations([report])).toEqual(new Map())
+  })
+})
+
+/**
+ * One source statement as two Vite environments spell it: the ssr map ends the
+ * declaration at its identifier, the jsdom/client map at the nested call, and
+ * both stop at their own line's end.
+ */
+const CRASH_LOOP = { start: { line: 36, column: 2 }, end: { line: 54, column: Infinity } }
+
+/** File path the canonicalization fixtures share. */
+const CANONICALIZED_FILE = 'packages/util/home-paths/src/index.ts'
+
+/** Istanbul statement location in the fixture's own terms. */
+interface StatementLocation {
+  start: { line: number; column: number }
+  end: { line: number; column: number }
+}
+
+/** Statement hits and locations read back from a merged istanbul map. */
+interface MergedStatements {
+  s: Record<string, number>
+  statementMap: Record<string, StatementLocation>
+}
+
+/** The istanbul entry points the merge assertions use. */
+interface CoverageLibrary {
+  createCoverageMap: (data: unknown) => {
+    merge: (data: unknown) => void
+    fileCoverageFor: (file: string) => MergedStatements
+  }
+}
+
+/**
+ * istanbul-lib-coverage is the merge implementation the partition blobs feed.
+ * It arrives as a dependency of the declared istanbul-lib-report devDependency,
+ * so this spec resolves it through that owner instead of declaring its own copy.
+ */
+const coverageLibrary = createRequire(
+  createRequire(import.meta.url).resolve('istanbul-lib-report'),
+)('istanbul-lib-coverage') as CoverageLibrary
+
+/** One file's statement coverage, shaped as a partition blob carries it. */
+function statementRecord(statements: StatementLocation[], hits: number[]): Record<string, unknown> {
+  return {
+    [CANONICALIZED_FILE]: {
+      path: CANONICALIZED_FILE,
+      statementMap: Object.fromEntries(statements.map((location, index) => [index, location])),
+      s: Object.fromEntries(hits.map((hit, index) => [index, hit])),
+      fnMap: {},
+      f: {},
+      branchMap: {},
+      b: {},
+    },
+  }
+}
+
+/**
+ * Merge partition records the way the coordinator's merge command does. The
+ * blob serializer's JSON hop turns a non-finite end column into `null`, which
+ * is what strips istanbul of the range containment it reconciles records with.
+ * Canonicalization runs on the `CoverageMap` the reporter hook receives, whose
+ * `data` holds the raw per-file records merged here.
+ */
+function mergePartitionRecords(
+  records: Array<Record<string, unknown>>,
+  canonicalize: boolean,
+): MergedStatements {
+  const map = coverageLibrary.createCoverageMap({})
+  for (const record of records) {
+    if (canonicalize) canonicalizeEndOfLineColumns({ data: record })
+    const serializedRecord: unknown = JSON.parse(JSON.stringify(record))
+    map.merge(serializedRecord)
+  }
+  return map.fileCoverageFor(CANONICALIZED_FILE)
+}
+
+/** Start positions of the statements the merged map still reports as unhit. */
+function uncoveredStarts(coverage: MergedStatements): Array<{ line: number; column: number }> {
+  return Object.entries(coverage.s)
+    .filter(([, hits]) => hits === 0)
+    .map(([index]) => coverage.statementMap[index])
+    .filter((location): location is StatementLocation => location !== undefined)
+    .map(location => location.start)
+}
+
+describe('coverage location canonicalization', () => {
+  // index.ts:48 as the ssr environment spells it (at `parent`) and as the
+  // client environment spells it (at `dirname(current)`); the loop holding
+  // both spellings ran in each, and only the client record never took the
+  // catch branch that owns the statement.
+  const ssrRecord = statementRecord(
+    [CRASH_LOOP, { start: { line: 48, column: 12 }, end: { line: 48, column: Infinity } }],
+    [3, 2],
+  )
+  const clientRecord = statementRecord(
+    [CRASH_LOOP, { start: { line: 48, column: 21 }, end: { line: 48, column: Infinity } }],
+    [5, 0],
+  )
+
+  it('drops the phantom statement a client-only spelling leaves after the blob merge', () => {
+    // 33 statements, 32 covered: the ssr spelling is hit while the client
+    // spelling of the same source statement stays unhit, so a file whose every
+    // statement ran fails the per-file 100% gate.
+    expect(uncoveredStarts(mergePartitionRecords([ssrRecord, clientRecord], false)))
+      .toEqual([{ line: 48, column: 21 }])
+
+    expect(uncoveredStarts(mergePartitionRecords([ssrRecord, clientRecord], true))).toEqual([])
+  })
+
+  it('canonicalizes line-end columns in statement, function, and branch locations', () => {
+    const lineEnd = (line: number): StatementLocation => ({
+      start: { line, column: 4 },
+      end: { line, column: Infinity },
+    })
+    const record = {
+      [CANONICALIZED_FILE]: {
+        path: CANONICALIZED_FILE,
+        statementMap: { 0: lineEnd(10), 1: { start: { line: 11, column: 4 }, end: { line: 11, column: 9 } } },
+        s: { 0: 1, 1: 1 },
+        fnMap: { 0: { name: 'probe', decl: lineEnd(10), loc: lineEnd(10) } },
+        f: { 0: 1 },
+        branchMap: { 0: { type: 'if', loc: lineEnd(12), locations: [lineEnd(12), lineEnd(13)] } },
+        b: { 0: [1, 1] },
+      },
+    }
+
+    canonicalizeEndOfLineColumns({ data: record })
+
+    const file = record[CANONICALIZED_FILE]
+    expect(file.statementMap[0]?.end.column).toBe(END_OF_LINE_COLUMN)
+    expect(file.statementMap[1]?.end.column).toBe(9)
+    expect(file.fnMap[0]?.decl.end.column).toBe(END_OF_LINE_COLUMN)
+    expect(file.fnMap[0]?.loc.end.column).toBe(END_OF_LINE_COLUMN)
+    expect(file.branchMap[0]?.loc.end.column).toBe(END_OF_LINE_COLUMN)
+    expect(file.branchMap[0]?.locations[0]?.end.column).toBe(END_OF_LINE_COLUMN)
+    expect(file.branchMap[0]?.locations[1]?.end.column).toBe(END_OF_LINE_COLUMN)
+  })
+
+  it('rejects a payload that carries no istanbul coverage data', () => {
+    // Vitest types the reporter hook as `unknown`, so a payload without the
+    // istanbul `data` record must fail the partition loudly rather than leave
+    // every location uncanonicalized.
+    expect(() => {
+      canonicalizeEndOfLineColumns(undefined)
+    }).toThrow(/not an istanbul CoverageMap/)
+    expect(() => {
+      canonicalizeEndOfLineColumns({})
+    }).toThrow(/not an istanbul CoverageMap/)
   })
 })
 
 describe('coverage partition coordinator', () => {
+  it.each(['omitted', 'unexpected', 'duplicate', 'malformed', 'unnamed', 'missing-report'])('refuses %s test results even when every partition exits successfully', async (failure) => {
+    const root = await temporaryRoot()
+    const runCommand = vi.fn(async (command: CoverageCommand) => {
+      await writeBlob(command)
+      if (command.label === 'partition 1/2') {
+        const reportArgument = command.args.find(argument => argument.startsWith('--outputFile.fileTimes='))!
+        const reportPath = join(root, reportArgument.slice('--outputFile.fileTimes='.length))
+        let report = JSON.parse(await readFile(reportPath, 'utf8')) as Array<{ file: string; duration: number }>
+        if (failure === 'omitted') report = []
+        if (failure === 'unexpected') report.push({ file: 'unassigned.spec.ts', duration: 0 })
+        if (failure === 'duplicate') report.push(report[0]!)
+        await writeFile(reportPath, failure === 'malformed' ? '{}' : JSON.stringify(report))
+        if (failure === 'unnamed') await writeFile(reportPath, '[{}]')
+        if (failure === 'missing-report') await rm(reportPath)
+      }
+      return passed
+    })
+    const coordinator = new CoveragePartitionCoordinator({
+      root, partitions: 2, pnpmEntrypoint: '/pnpm.cjs', files: ['a.spec.ts', 'b.spec.ts'], runCommand,
+    })
+    await expect(coordinator.run()).rejects.toThrow()
+    expect(runCommand).toHaveBeenCalledTimes(2)
+    await expect(access(join(root, 'coverage/.partitioned/vitest-partition-1.config.ts'))).resolves.toBeUndefined()
+  })
+
   const weightedFiles = ['a.spec.ts', 'b.spec.ts', 'c.spec.ts']
   const weightedDurations = new Map([
     ['a.spec.ts', 100],
@@ -256,6 +502,35 @@ describe('coverage partition coordinator', () => {
     ['b.spec.ts', 'process-bound'],
     ['c.spec.ts', 'process-bound'],
   ])
+  it('passes the canonicalizing reporter to every partition', async () => {
+    const root = await temporaryRoot()
+    const commands: CoverageCommand[] = []
+    const runCommand = successfulCommandRecorder(commands)
+    const coordinator = new CoveragePartitionCoordinator({
+      root,
+      partitions: 2,
+      pnpmEntrypoint: '/pnpm.cjs',
+      files: ['a.spec.ts', 'b.spec.ts'],
+      runCommand,
+    })
+
+    await expect(coordinator.run()).resolves.toBe(0)
+    await expect(access(join(root, 'coverage/.partitioned'))).rejects.toMatchObject({ code: 'ENOENT' })
+
+    // The coordinator passes a root-relative argument and runs every child with
+    // the repository root as its working directory, so the argument must name
+    // the reporter that sits beside this spec. Whether that reporter runs
+    // before the blob write is Vitest's reporter ordering, not a command the
+    // coordinator builds.
+    const specDirectory = dirname(fileURLToPath(import.meta.url))
+    const reporterPath = join(specDirectory, 'coverage-canonical-locations.ts')
+    for (const command of commands.slice(0, 2)) {
+      const argument = command.args.find(candidate => candidate.startsWith('--reporter=') && candidate.endsWith('coverage-canonical-locations.ts'))
+      if (argument === undefined) throw new Error(`${command.label} does not wire the coverage canonicalizer`)
+      expect(resolve(specDirectory, '..', argument.slice('--reporter='.length))).toBe(reporterPath)
+    }
+  })
+
   it('runs every single-worker partition before one merged threshold check', async () => {
     const root = await temporaryRoot()
     const commands: CoverageCommand[] = []
@@ -295,9 +570,10 @@ describe('coverage partition coordinator', () => {
         '--maxWorkers=1',
         '--reporter=default',
         '--reporter=blob',
-        '--reporter=json',
         '--testTimeout=30000',
       ]))
+      expect(command.args).not.toContain('--reporter=json')
+      expect(command.args).toContain('--reporter=./scripts/coverage-file-times.ts')
       expect(command.args).not.toContain('--shard=1/3')
       expect(command.args.some(argument => argument.startsWith('--config='))).toBe(true)
       expect(command.env).toEqual({
@@ -314,6 +590,8 @@ describe('coverage partition coordinator', () => {
     expect(allConfigs).toContain('c.spec.ts')
     for (const source of partitionConfigs) {
       expect(source).toContain("from '../../vitest.config.ts'")
+      expect(source).toContain("from '../../scripts/coverage-fork-diagnostics.ts'")
+      expect(source).toContain('pool: coverageForkPool')
     }
     const mergeCommand = commands[3]
     if (mergeCommand === undefined) throw new Error('coverage merge command was not observed')
@@ -500,5 +778,185 @@ describe('coverage partition coordinator', () => {
 
     await expect(coordinator.run()).resolves.toBe(0)
     await expect(access(marker)).resolves.toBeUndefined()
+  })
+})
+
+describe('coverage file shards', () => {
+  // An absolute checkout root on any platform, distinct from every temporary root.
+  const otherCheckout = join(tmpdir(), 'dsh-coverage-other-checkout')
+
+  it.each([
+    [undefined, undefined],
+    ['', undefined],
+    ['1/2', { index: 1, count: 2 }],
+    ['2/2', { index: 2, count: 2 }],
+  ])('parses %j', (raw, expected) => {
+    expect(parseCoverageShard(raw)).toEqual(expected)
+  })
+
+  it.each(['3/2', '0/2', '1/0', 'a/b', '1'])('rejects %j', (raw) => {
+    expect(() => parseCoverageShard(raw)).toThrow(/DSH_COVERAGE_SHARD must be <index>\/<count>/)
+  })
+
+  const sizes = new Map([['a.spec.ts', 90], ['b.spec.ts', 60], ['c.spec.ts', 50], ['d.spec.ts', 30], ['e.spec.ts', 20], ['f.spec.ts', 20]])
+  const sizeOf = (file: string): number => sizes.get(file) ?? 0
+  const inventory = [...sizes.keys()]
+
+  it('deals files largest first to the lighter shard, independent of input order', () => {
+    expect(selectCoverageShardFiles(inventory, { index: 1, count: 2 }, sizeOf)).toEqual(['a.spec.ts', 'd.spec.ts', 'f.spec.ts'])
+    expect(selectCoverageShardFiles(inventory, { index: 2, count: 2 }, sizeOf)).toEqual(['b.spec.ts', 'c.spec.ts', 'e.spec.ts'])
+    expect(selectCoverageShardFiles([...inventory].reverse(), { index: 1, count: 2 }, sizeOf))
+      .toEqual(selectCoverageShardFiles(inventory, { index: 1, count: 2 }, sizeOf))
+  })
+
+  it.each([2, 3])('assigns every file to exactly one of %i shards', (count) => {
+    const shards = Array.from({ length: count }, (_, index) => selectCoverageShardFiles(inventory, { index: index + 1, count }, sizeOf))
+    expect(shards.flat().sort()).toEqual([...inventory].sort())
+  })
+
+  it('collects Vitest failure lines across split chunks and color codes', () => {
+    const collector = new FailedTestCollector()
+    collector.add('stdout', ' ✓ passes\n \u001b[31m×\u001b[39m breaks the con')
+    collector.add('stdout', 'tract 12ms\n')
+    collector.add('stderr', ' FAIL  |thread-safe| a.spec.ts > suite > breaks the contract\nAssertionError: x\n FAIL  b.spec.ts')
+
+    expect(collector.lines()).toEqual([
+      '× breaks the contract 12ms',
+      'FAIL  |thread-safe| a.spec.ts > suite > breaks the contract',
+      'FAIL  b.spec.ts',
+    ])
+  })
+
+  it('writes the shard manifest, blobs, and durations instead of merging', async () => {
+    const root = await temporaryRoot()
+    // Byte sizes 40, 30, 20, 10 deal a and d to shard 1, b and c to shard 2.
+    for (const [file, size] of [['a.spec.ts', 40], ['b.spec.ts', 30], ['c.spec.ts', 20], ['d.spec.ts', 10]] as const) {
+      await writeFile(join(root, file), 'x'.repeat(size))
+    }
+    const commands: CoverageCommand[] = []
+    const coordinator = new CoveragePartitionCoordinator({
+      root,
+      partitions: 2,
+      pnpmEntrypoint: '/pnpm.cjs',
+      files: ['a.spec.ts', 'b.spec.ts', 'c.spec.ts', 'd.spec.ts'],
+      shard: { index: 2, count: 2 },
+      runCommand: successfulCommandRecorder(commands),
+    })
+
+    await expect(coordinator.run()).resolves.toBe(0)
+
+    expect(commands.map(command => command.label)).toEqual(['partition 1/2', 'partition 2/2'])
+    const directory = join(root, COVERAGE_SHARD_DIRECTORY)
+    const manifest = JSON.parse(await readFile(join(directory, 'shard.json'), 'utf8')) as { shard: string; files: string[]; blobs: string[] }
+    expect(manifest).toEqual({
+      shard: '2/2',
+      root,
+      files: ['b.spec.ts', 'c.spec.ts'],
+      blobs: ['shard-2-partition-1.json', 'shard-2-partition-2.json'],
+    })
+    for (const blob of manifest.blobs) await expect(access(join(directory, 'blobs', blob))).resolves.toBeUndefined()
+    const times = JSON.parse(await readFile(join(directory, 'times.json'), 'utf8')) as Array<{ file: string }>
+    expect(times.map(entry => entry.file).sort()).toEqual(['b.spec.ts', 'c.spec.ts'])
+  })
+
+  /** Write one shard output directory as the report job downloads it. */
+  async function writeShardOutput(
+    input: string,
+    index: number,
+    files: readonly string[],
+    root: string,
+    blobs = [`shard-${index}-partition-1.json`],
+  ): Promise<void> {
+    const directory = join(input, `coverage-blobs-${index}`)
+    await mkdir(join(directory, 'blobs'), { recursive: true })
+    for (const blob of blobs) await writeFile(join(directory, 'blobs', blob), JSON.stringify([join(root, 'packages', 'a', 'src', 'index.ts')]))
+    await writeFile(join(directory, 'shard.json'), JSON.stringify({ shard: `${index}/2`, root, files, blobs }))
+    await writeFile(join(directory, 'times.json'), JSON.stringify(files.map(file => ({ file, duration: 7 }))))
+  }
+
+  async function mergeFixture(first: readonly string[], second: readonly string[]) {
+    const root = await temporaryRoot()
+    const input = await temporaryRoot()
+    await writeShardOutput(input, 1, first, root)
+    await writeShardOutput(input, 2, second, otherCheckout)
+    const commands: CoverageCommand[] = []
+    const merge = () => mergeCoverageShards({
+      root,
+      pnpmEntrypoint: '/pnpm.cjs',
+      inputDirectory: input,
+      inventory: ['a.spec.ts', 'b.spec.ts', 'c.spec.ts'],
+      runCommand: vi.fn(async (command: CoverageCommand) => {
+        commands.push(command)
+        return passed
+      }),
+    })
+    return { root, input, commands, merge }
+  }
+
+  it('merges every shard blob once and records the shard durations', async () => {
+    const { root, commands, merge } = await mergeFixture(['a.spec.ts', 'c.spec.ts'], ['b.spec.ts'])
+
+    await expect(merge()).resolves.toBe(0)
+
+    expect(commands).toHaveLength(1)
+    expect(commands[0]!.label).toBe('merged coverage report')
+    expect(commands[0]!.args).toContain('--merge-reports=coverage/.merge/blobs')
+    expect([...readFileDurations(root).keys()].sort()).toEqual(['a.spec.ts', 'b.spec.ts', 'c.spec.ts'])
+  })
+
+  it('rewrites the blob paths of a shard that ran in another checkout to this checkout', async () => {
+    const root = await temporaryRoot()
+    const input = await temporaryRoot()
+    await writeShardOutput(input, 1, ['a.spec.ts', 'c.spec.ts'], root)
+    await writeShardOutput(input, 2, ['b.spec.ts'], otherCheckout)
+    const merged: string[] = []
+    await expect(mergeCoverageShards({
+      root,
+      pnpmEntrypoint: '/pnpm.cjs',
+      inputDirectory: input,
+      inventory: ['a.spec.ts', 'b.spec.ts', 'c.spec.ts'],
+      runCommand: vi.fn(async () => {
+        for (const blob of ['shard-1-partition-1.json', 'shard-2-partition-1.json']) {
+          merged.push(...JSON.parse(await readFile(join(root, 'coverage/.merge/blobs', blob), 'utf8')) as string[])
+        }
+        return passed
+      }),
+    })).resolves.toBe(0)
+
+    expect(merged).toEqual([join(root, 'packages', 'a', 'src', 'index.ts'), join(root, 'packages', 'a', 'src', 'index.ts')])
+  })
+
+  it.each([
+    ['overlapping', ['a.spec.ts', 'b.spec.ts'], ['b.spec.ts', 'c.spec.ts']],
+    ['incomplete', ['a.spec.ts'], ['b.spec.ts']],
+    ['unexpected', ['a.spec.ts', 'c.spec.ts'], ['b.spec.ts', 'z.spec.ts']],
+  ])('refuses %s shard file lists before merging', async (_case, first, second) => {
+    const { commands, merge } = await mergeFixture(first, second)
+
+    await expect(merge()).rejects.toThrow(/must partition the instrumented inventory/)
+    expect(commands).toEqual([])
+  })
+
+  it('refuses a listed blob that the shard did not upload', async () => {
+    const { input, commands, merge } = await mergeFixture(['a.spec.ts', 'c.spec.ts'], ['b.spec.ts'])
+    await rm(join(input, 'coverage-blobs-2', 'blobs', 'shard-2-partition-1.json'))
+
+    await expect(merge()).rejects.toThrow(/blob shard-2-partition-1.json is missing or empty/)
+    expect(commands).toEqual([])
+  })
+
+  it('refuses a missing shard', async () => {
+    const { input, commands, merge } = await mergeFixture(['a.spec.ts', 'c.spec.ts'], ['b.spec.ts'])
+    await rm(join(input, 'coverage-blobs-2'), { recursive: true })
+
+    await expect(merge()).rejects.toThrow(/expected shards 1..n of one count/)
+    expect(commands).toEqual([])
+  })
+
+  it('refuses shard input inside the coverage directory it replaces', async () => {
+    const root = await temporaryRoot()
+    await expect(mergeCoverageShards({
+      root, pnpmEntrypoint: '/pnpm.cjs', inputDirectory: join(root, 'coverage', 'shards'), inventory: [],
+    })).rejects.toThrow(/must lie outside/)
   })
 })

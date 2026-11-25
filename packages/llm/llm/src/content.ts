@@ -1,9 +1,15 @@
 /** Content-block structure helpers. @module @deepseek-ai/dsh-llm/content */
 
-import type { ContentBlock } from './types.ts'
+import type { ContentBlock, ToolSchema, ToolUpdate, ToolHistory } from './types.ts'
+import type { RequestMessage } from './types.ts'
 import type { Message } from './message.ts'
-import type { AttachmentStore, ImageAttachmentRef, ImageMediaType, RequestImageAttachment } from '@deepseek-ai/dsh-attachment'
+import type { MessageId } from './types.ts'
+import type {
+  AttachmentStore, FileAttachmentRef, ImageAttachmentRef, ImageMediaType, RequestImageAttachment,
+} from '@deepseek-ai/dsh-attachment'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
+
+export { requiredImageOffload } from './request-images.ts'
 
 /** Execution-world path that model tools can use to read one normalized attachment. */
 export interface ImageAttachmentAccess {
@@ -114,87 +120,146 @@ export function offloadedImageText(
 }
 
 /**
- * True when typed model content contains an image block, walking nested
- * tool-result content. This is the one recursive image walk shared by every
- * image policy (capability gating, text-only serialization, compaction
- * survey), so a consumer cannot silently diverge on nesting depth.
+ * True when typed model content contains an image block. This is the one image
+ * walk shared by every image policy (capability gating, text-only
+ * serialization, compaction survey), so a consumer cannot silently diverge.
  * @param content - typed model content blocks.
- * @returns whether any nested block is an image.
+ * @returns whether any block is an image.
  */
 export function contentHasImage(content: readonly ContentBlock[]): boolean {
-  return content.some(block => block.type === 'image'
-    || (block.type === 'tool-result' && contentHasImage(block.content)))
+  return content.some(block => block.type === 'image')
 }
 
-/** Base64 length of raw image bytes, including padding. */
-function base64Length(bytes: number): number {
-  return Math.ceil(bytes / 3) * 4
-}
-
-/** Byte accounting and quantized removal policy for one request representation. */
-export interface RequestImageOffloadPolicy {
-  /** Image count accepted by the route; omission leaves count unbounded. */
-  maxImages?: number
-  /** Accumulated image bytes accepted by the route; omission leaves bytes unbounded. */
-  maxBytes?: number
-  /** Number of excess images removed as one deterministic step. */
-  countQuantum?: number
-  /** Number of excess bytes removed as one deterministic step. */
-  byteQuantum?: number
-  /** Whether byte accounting uses raw file bytes or inline base64 length. */
-  representation: 'raw' | 'base64'
-  /** Resolve the encoded request-version length; omission uses normalized attachment bytes. */
-  byteLength?: (ref: ImageAttachmentRef) => number
-  /** Build the model-visible replacement for each omitted attachment. */
-  placeholder: (ref: ImageAttachmentRef) => string
-}
-
-/** Collect represented image lengths in request and nested-block order. */
-function collectImageLengths(
-  blocks: readonly ContentBlock[],
-  lengths: number[],
-  policy: RequestImageOffloadPolicy,
-): void {
-  for (const block of blocks) {
-    if (block.type === 'image') {
-      const bytes = policy.byteLength === undefined
-        ? block.attachment.bytes
-        : policy.byteLength(block.attachment)
-      lengths.push(policy.representation === 'base64' ? base64Length(bytes) : bytes)
-    } else if (block.type === 'tool-result') {
-      collectImageLengths(block.content, lengths, policy)
-    }
+/**
+ * True when typed model content contains a file block.
+ * Reads current content on every call without retaining scan results.
+ * @param content - typed model content blocks.
+ * @returns whether any block is a file.
+ */
+export function contentHasFile(content: readonly ContentBlock[]): boolean {
+  for (const block of content) {
+    if (block.type === 'file') return true
   }
+  return false
 }
 
-/** Replace the first `remaining.count` image occurrences without mutating durable messages. */
-function replaceOldestImages(
+/**
+ * Stable model-facing handle for one durable file reference: the address of
+ * the verbatim stored copy and the instruction to read it on demand. This is
+ * the only representation a provider ever receives for a file.
+ * @param ref - durable verbatim file reference.
+ * @param readonlyPath - execution-world path of the stored copy, when resolvable.
+ * @returns deterministic handle text naming the file, its size, and its address.
+ */
+export function fileHandleText(ref: FileAttachmentRef, readonlyPath: string | undefined): string {
+  const digest = String(ref.attachmentId).slice('sha256:'.length, 'sha256:'.length + 8)
+  const identity = `File ${quoted(ref.name)} (${ref.bytes} bytes, sha256:${digest})`
+  if (readonlyPath === undefined) {
+    return `[${identity} was uploaded, but the current execution environment cannot access a readable path. Report that limitation if its contents are needed; do not claim to have read it.]`
+  }
+  return `[${identity}: verbatim read-only copy saved at ${quoted(readonlyPath)}. Read that path with your file tools when its contents are needed; copy it to a writable location before modifying it. When delegating file work, include this saved path in the delegation prompt; only subagents sharing this execution environment can read it.]`
+}
+
+/** Replace every file occurrence with handle text. */
+function replaceFilesWithHandles(
   blocks: readonly ContentBlock[],
-  remaining: { count: number },
-  placeholder: (ref: ImageAttachmentRef) => string,
+  resolvePath: (ref: FileAttachmentRef) => string | undefined,
 ): ContentBlock[] {
   let next: ContentBlock[] | undefined
   for (const [index, block] of blocks.entries()) {
-    if (block.type === 'image' && remaining.count > 0) {
-      remaining.count -= 1
+    if (block.type === 'file') {
       next ??= blocks.slice(0, index)
-      next.push({ type: 'text', text: placeholder(block.attachment) })
+      next.push({ type: 'text', text: fileHandleText(block.attachment, resolvePath(block.attachment)) })
       continue
-    }
-    if (block.type === 'tool-result') {
-      const content = replaceOldestImages(block.content, remaining, placeholder)
-      if (content !== block.content) {
-        next ??= blocks.slice(0, index)
-        next.push({ ...block, content })
-        continue
-      }
     }
     next?.push(block)
   }
   return next ?? blocks as ContentBlock[]
 }
 
-/** Replace every image occurrence, including nested tool results, for a text-only model. */
+/**
+ * Project request file content into deterministic handle text for every model
+ * route. Unlike images, no provider receives file blocks natively, so this
+ * projection is unconditional in request assembly.
+ * @param messages - complete request history.
+ * @param resolvePath - resolve one reference's current execution-world read path.
+ * @returns the original list without files, otherwise shallow message copies with handle text.
+ */
+export function projectFilesToText(
+  messages: readonly Message[],
+  resolvePath: (ref: FileAttachmentRef) => string | undefined,
+): readonly Message[]
+/**
+ * Project file content in mixed durable and request-only inputs.
+ * @param messages - complete request inputs.
+ * @param resolvePath - resolve a reference's execution-world read path.
+ * @returns original inputs without files, otherwise copies with handle text.
+ */
+export function projectFilesToText(
+  messages: readonly RequestMessage[],
+  resolvePath: (ref: FileAttachmentRef) => string | undefined,
+): readonly RequestMessage[]
+export function projectFilesToText(
+  messages: readonly RequestMessage[],
+  resolvePath: (ref: FileAttachmentRef) => string | undefined,
+): readonly RequestMessage[] {
+  if (!messages.some(message => contentHasFile(message.content))) return messages
+  return messages.map((message) => {
+    const content = replaceFilesWithHandles(message.content, resolvePath)
+    return content === message.content ? message : { ...message, content }
+  })
+}
+
+/** Replace every offloaded occurrence with its placeholder. */
+function replaceOffloadedImages(
+  blocks: readonly ContentBlock[],
+  placeholder: (ref: ImageAttachmentRef) => string,
+): ContentBlock[] {
+  let next: ContentBlock[] | undefined
+  for (const [index, block] of blocks.entries()) {
+    if (block.type === 'image' && block.offloaded === true) {
+      next ??= blocks.slice(0, index)
+      next.push({ type: 'text', text: placeholder(block.attachment) })
+      continue
+    }
+    next?.push(block)
+  }
+  return next ?? blocks as ContentBlock[]
+}
+
+/**
+ * Project the surface's offloaded occurrences into deterministic text for one
+ * request. The offloaded set is a durable surface fact, so every route sends
+ * the same set; only the placeholder text is route-owned.
+ * @param messages - derived request history.
+ * @param placeholder - build the model-visible replacement for one offloaded attachment.
+ * @returns the original list when nothing is offloaded, otherwise shallow message copies with placeholders.
+ */
+export function projectOffloadedImages(
+  messages: readonly Message[],
+  placeholder: (ref: ImageAttachmentRef) => string,
+): readonly Message[]
+/**
+ * Project offloaded images in mixed durable and request-only inputs.
+ * @param messages - complete request inputs.
+ * @param placeholder - replacement text for an offloaded attachment.
+ * @returns original messages or shallow copies with placeholders.
+ */
+export function projectOffloadedImages(
+  messages: readonly RequestMessage[],
+  placeholder: (ref: ImageAttachmentRef) => string,
+): readonly RequestMessage[]
+export function projectOffloadedImages(
+  messages: readonly RequestMessage[],
+  placeholder: (ref: ImageAttachmentRef) => string,
+): readonly RequestMessage[] {
+  return messages.map((message) => {
+    const content = replaceOffloadedImages(message.content, placeholder)
+    return content === message.content ? message : { ...message, content }
+  })
+}
+
+/** Replace every image occurrence for a text-only model. */
 function replaceImagesForTextModel(blocks: readonly ContentBlock[]): ContentBlock[] {
   let next: ContentBlock[] | undefined
   for (const [index, block] of blocks.entries()) {
@@ -203,25 +268,24 @@ function replaceImagesForTextModel(blocks: readonly ContentBlock[]): ContentBloc
       next.push({ type: 'text', text: textOnlyImageText(block.attachment) })
       continue
     }
-    if (block.type === 'tool-result') {
-      const content = replaceImagesForTextModel(block.content)
-      if (content !== block.content) {
-        next ??= blocks.slice(0, index)
-        next.push({ ...block, content })
-        continue
-      }
-    }
     next?.push(block)
   }
   return next ?? blocks as ContentBlock[]
 }
 
 /**
- * Project durable image history into deterministic text for an exact text-only model.
+ * Project request image content into deterministic text for an exact text-only model.
  * @param messages - complete request history.
  * @returns the original list without images, otherwise shallow message copies with stable placeholders.
  */
-export function projectImagesForTextModel(messages: readonly Message[]): readonly Message[] {
+export function projectImagesForTextModel(messages: readonly Message[]): readonly Message[]
+/**
+ * Project image content in mixed durable and request-only inputs for a text-only model.
+ * @param messages - complete request inputs.
+ * @returns original inputs without images, otherwise copies with stable placeholders.
+ */
+export function projectImagesForTextModel(messages: readonly RequestMessage[]): readonly RequestMessage[]
+export function projectImagesForTextModel(messages: readonly RequestMessage[]): readonly RequestMessage[] {
   if (!messages.some(message => contentHasImage(message.content))) return messages
   return messages.map((message) => {
     const content = replaceImagesForTextModel(message.content)
@@ -229,61 +293,145 @@ export function projectImagesForTextModel(messages: readonly Message[]): readonl
   })
 }
 
-/**
- * Number of oldest image occurrences one request projection removes, in whole
- * count and byte quanta, once a route budget is exceeded. The result depends
- * only on the represented lengths, so provider request pricing reproduces the
- * exact serialization decision without building the projected messages.
- * @param lengths - represented byte length of every occurrence, in request order.
- * @param policy - count/byte budgets and removal quanta; unbounded when absent.
- * @returns how many leading occurrences the projection replaces with placeholders.
- */
-export function offloadedImagePrefixCount(
-  lengths: readonly number[],
-  policy: Pick<RequestImageOffloadPolicy, 'maxImages' | 'maxBytes' | 'countQuantum' | 'byteQuantum'>,
-): number {
-  const total = lengths.reduce((sum, bytes) => sum + bytes, 0)
-  const excessCount = policy.maxImages === undefined ? 0 : Math.max(0, lengths.length - policy.maxImages)
-  const excessBytes = policy.maxBytes === undefined ? 0 : Math.max(0, total - policy.maxBytes)
-  if (excessCount === 0 && excessBytes === 0) return 0
-  const countQuantum = policy.countQuantum ?? 1
-  const byteQuantum = policy.byteQuantum ?? 1
-  const removeCount = excessCount === 0 ? 0 : Math.ceil(excessCount / countQuantum) * countQuantum
-  const removeBytes = excessBytes === 0 ? 0 : Math.ceil(excessBytes / byteQuantum) * byteQuantum
-  let count = 0
-  let removedBytes = 0
-  for (const imageBytes of lengths) {
-    const byteTargetMet = removeBytes === 0
-      || (byteQuantum === 1 ? removedBytes >= removeBytes : removedBytes > removeBytes)
-    if (count >= removeCount && byteTargetMet) break
-    removedBytes += imageBytes
-    count += 1
+/** Request messages and tools after one route's tool update projection. */
+export interface ProjectedToolUpdates {
+  /** History with only the developer updates supported by this route and declaration series. */
+  readonly messages: readonly RequestMessage[]
+  /** Provider declarations, including deferred and retained definitions when supported. */
+  readonly tools: readonly ToolSchema[] | undefined
+}
+
+function withoutDeveloperMessages(messages: readonly RequestMessage[]): readonly RequestMessage[] {
+  const retained = messages.filter(message => message.role !== 'developer')
+  return retained.length === messages.length ? messages : retained
+}
+
+function toolDeclarations(history: ToolHistory): Map<string, ToolSchema> {
+  const declarations = new Map(history.tools.map(tool => [tool.name, tool]))
+  for (const update of history.updates) {
+    for (const tool of update.additions) {
+      if (!declarations.has(tool.name)) {
+        // Later additions activate these definitions at their recorded position.
+        declarations.set(tool.name, { ...tool, deferLoading: true })
+      }
+    }
   }
-  return count
+
+  return declarations
+}
+
+/** Rebuild declarations on removals or additions to an empty set, where the request prefix changes. */
+function rebaseAdditionOnlyHistory(
+  history: ToolHistory,
+  messages: ReadonlyMap<MessageId, readonly ContentBlock[]>,
+): ToolHistory {
+  const available = new Map(history.tools.map(tool => [tool.name, tool]))
+  let baseline = history.tools
+  let retainedFrom = 0
+  for (const [index, update] of history.updates.entries()) {
+    const additions = new Map(update.additions.map(tool => [tool.name, tool]))
+    let reset = available.size === 0 && additions.size > 0
+    // Completeness was checked before projection; Session resolves every addition's definition.
+    for (const block of messages.get(update.messageId) as readonly ContentBlock[]) {
+      if (block.type === 'tool-addition') {
+        const { deferLoading: _loading, ...tool } = additions.get(block.toolName) as ToolSchema
+        available.set(tool.name, tool)
+      } else if (block.type === 'tool-removal') {
+        reset = true
+        available.delete(block.toolName)
+      }
+    }
+    if (reset) {
+      baseline = [...available.values()]
+      retainedFrom = index + 1
+    }
+  }
+  return retainedFrom === 0 ? history : { tools: baseline, updates: history.updates.slice(retainedFrom) }
 }
 
 /**
- * Return a deterministic transient projection whose oldest images are replaced
- * in whole count and byte quanta after a route budget is exceeded. The target
- * depends only on complete durable history: at 129 one-megabyte images under
- * a 128 MiB bound with a 64 MiB quantum, the oldest 65 images are removed so
- * 64 MiB remain; that removed prefix stays fixed until total history exceeds
- * 192 MiB.
- * @param messages - complete request history, oldest first.
- * @param policy - route representation, budgets, and removal quanta.
- * @returns original messages below both bounds, otherwise shallow copies with deterministic placeholders.
+ * Construct provider declarations from session-folded history without changing logged active tools.
+ * Unsupported routes and incomplete history use current declarations without developer updates.
+ * Explicitly deferred declarations require an addition to activate them.
+ * A rebuild makes previously activated declarations immediate; unactivated declarations stay deferred.
+ * Addition-only routes rebuild when a tool is removed or tools are added to an empty set;
+ * deferred declarations count as existing tools.
+ * Later additions remain deferred and superseded tool blocks are omitted without dropping other content.
+ * @param messages - complete request inputs, or the prefix selected for an auxiliary call.
+ * @param tools - currently active tool schemas.
+ * @param toolUpdate - the resolved route's update mode.
+ * @param history - immutable state folded from committed headers and developer messages.
+ * @returns provider declarations and the corresponding filtered history.
  */
-export function offloadRequestImagesWithPolicy(
-  messages: readonly Message[],
-  policy: RequestImageOffloadPolicy,
-): readonly Message[] {
-  const lengths: number[] = []
-  for (const message of messages) collectImageLengths(message.content, lengths, policy)
-  const count = offloadedImagePrefixCount(lengths, policy)
-  if (count === 0) return messages
-  const remaining = { count }
-  return messages.map((message) => {
-    const content = replaceOldestImages(message.content, remaining, policy.placeholder)
-    return content === message.content ? message : { ...message, content }
-  })
+export function projectToolUpdates(
+  messages: readonly RequestMessage[],
+  tools: readonly ToolSchema[] | undefined,
+  toolUpdate: ToolUpdate | undefined,
+  history?: ToolHistory,
+): ProjectedToolUpdates {
+  if (toolUpdate === undefined) {
+    // Unsupported routes need immediately available tools and no update messages.
+    let immediateTools = tools
+    if (tools?.some(tool => tool.deferLoading === true)) {
+      immediateTools = tools.map(({ deferLoading: _loading, ...tool }) => tool)
+    }
+    return { messages: withoutDeveloperMessages(messages), tools: immediateTools }
+  }
+
+  if (history === undefined) {
+    // Current schemas alone cannot resolve definitions referenced by past updates.
+    return { messages: withoutDeveloperMessages(messages), tools }
+  }
+  const updates = new Map(messages.flatMap(message => message.role === 'developer' ? [[message.id, message.content] as const] : []))
+  if (history.updates.some(update => !updates.has(update.messageId))) {
+    // An auxiliary prefix may omit updates needed to activate historical declarations.
+    return { messages: withoutDeveloperMessages(messages), tools }
+  }
+
+  const projectedHistory = toolUpdate === 'addition-only' ? rebaseAdditionOnlyHistory(history, updates) : history
+  const declarations = toolDeclarations(projectedHistory)
+  const updateIds = new Set(history.updates.map(update => update.messageId))
+  const retainedUpdateIds = new Set(projectedHistory.updates.map(update => update.messageId))
+  // Deferred baseline tools still need their first addition to become available.
+  const offered = new Set(projectedHistory.tools.filter(tool => !tool.deferLoading).map(tool => tool.name))
+  const projectedMessages: RequestMessage[] = []
+  for (const message of messages) {
+    if (message.role !== 'developer') {
+      projectedMessages.push(message)
+      continue
+    }
+    // Earlier declaration series do not govern the current tool set.
+    if (!updateIds.has(message.id)) continue
+
+    const content = message.content.filter((block) => {
+      switch (block.type) {
+        case 'tool-addition':
+          if (!retainedUpdateIds.has(message.id)) return false
+          // Only declared tools that are not already available need activation.
+          if (!declarations.has(block.toolName) || offered.has(block.toolName)) return false
+          offered.add(block.toolName)
+          return true
+        case 'tool-removal':
+          // Addition-only routes cannot deactivate a tool through history.
+          if (toolUpdate !== 'in-history') return false
+          return offered.delete(block.toolName)
+        default:
+          // Other core and plugin-defined blocks retain their content and order.
+          return true
+      }
+    })
+    if (content.length === 0) continue
+    if (content.length === message.content.length) {
+      projectedMessages.push(message)
+    } else {
+      projectedMessages.push({ ...message, content })
+    }
+  }
+
+  const unchanged = projectedMessages.length === messages.length
+    && projectedMessages.every((message, index) => message === messages[index])
+  return {
+    messages: unchanged ? messages : projectedMessages,
+    tools: [...declarations.values()],
+  }
 }

@@ -3,7 +3,7 @@
 import type {
   SessionHistoryRecord,
 } from '../../types.ts'
-import type { SessionEventLikeEntry } from '../contract/events.ts'
+import type { SessionEventLikeEntry, SessionLiveEventEntry } from '../contract/events.ts'
 
 /**
  * Narrow aligned wire records to their Client event types without allocation.
@@ -13,12 +13,26 @@ import type { SessionEventLikeEntry } from '../contract/events.ts'
 export function historyEntries(
   records: readonly SessionHistoryRecord[],
 ): readonly SessionEventLikeEntry[] {
-  return records as unknown as readonly SessionEventLikeEntry[]
+  // Both views share the same validated objects.
+  const aligned: readonly unknown[] = records
+  return aligned as readonly SessionEventLikeEntry[]
+}
+
+/**
+ * View durable window entries, which the Client received as validated wire records, as those records again.
+ * @param entries - durable entries taken from the event window.
+ * @returns the same array typed as history transport records.
+ */
+export function historyRecords(
+  entries: readonly SessionLiveEventEntry[],
+): readonly SessionHistoryRecord[] {
+  const aligned: readonly unknown[] = entries
+  return aligned as readonly SessionHistoryRecord[]
 }
 
 /**
  * Read the first logical sequence represented by one wire record.
- * @param record - validated scalar event or packed Assistant delta run.
+ * @param record - validated Session event.
  * @returns inclusive first Session sequence.
  */
 export function historyRecordFirstSeq(record: SessionHistoryRecord): number {
@@ -27,13 +41,9 @@ export function historyRecordFirstSeq(record: SessionHistoryRecord): number {
 
 /**
  * Read the final logical sequence represented by one wire record.
- * @param record - validated scalar event or packed Assistant delta run.
+ * @param record - validated Session event.
  * @returns inclusive final Session sequence.
  */
 export function historyRecordLastSeq(record: SessionHistoryRecord): number {
-  if (record.type === 'event') return record.event.seq
-  const length = record.event.type === 'chunkrow/tool-call-chunks'
-    ? record.event.data.args.length
-    : record.event.data.texts.length
-  return record.event.seq + length - 1
+  return record.event.seq
 }

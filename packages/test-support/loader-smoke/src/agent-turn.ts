@@ -5,7 +5,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { createUserMessage, type TokenUsage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, expandAssistantStream, type TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 
 /** Result envelope consumed only by snapshot and composition tests. */
@@ -44,7 +44,7 @@ async function onlyRootAgent(ctx: Context): Promise<Agent> {
   // Configured agents publish asynchronously (persistence create/resume runs
   // before publication), so a settled Loader does not imply a registered
   // agent yet; wait for the first publication instead of requiring it.
-  if (registry.roots().length === 0) {
+  if (registry.list().filter(agent => agent.session.header.origin !== 'subagent').length === 0) {
     await new Promise<void>((resolve) => {
       const dispose = ctx.on('agent/created', () => {
         dispose()
@@ -52,7 +52,7 @@ async function onlyRootAgent(ctx: Context): Promise<Agent> {
       })
     })
   }
-  const agents = registry.roots()
+  const agents = registry.list().filter(agent => agent.session.header.origin !== 'subagent')
   const [agent] = agents
   if (agent === undefined || agents.length !== 1) {
     throw new Error(`fixture turn requires exactly one top-level agent, found ${agents.length}`)
@@ -85,13 +85,16 @@ export async function runFixtureTurn(ctx: Context, options: FixtureTurnOptions):
       received = true
     }
     options.onEvent?.(session.id, event)
-    if (event.type === 'assistant/chunk' && event.data.chunk.type === 'usage') {
-      usageByStep.set(`${event.data.turn}/${event.data.step}`, event.data.chunk.usage)
-    }
     if (event.type === 'assistant/message') {
       output = assistantText(event) ?? output
       if (event.data.usage !== undefined) {
         usageByStep.set(`${event.data.turn}/${event.data.step}`, event.data.usage)
+      }
+    } else if (event.type === 'assistant/attempt') {
+      const usage = expandAssistantStream(event.data.stream)
+        .findLast(member => member.chunk.type === 'usage')?.chunk
+      if (usage?.type === 'usage') {
+        usageByStep.set(`${event.data.turn}/${event.data.step}`, usage.usage)
       }
     }
   })

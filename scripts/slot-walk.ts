@@ -1,10 +1,8 @@
 /**
  * AST helpers for the client slot surface: the `SlotMap` declaration merges
- * that type every slot, and the `slots.register` call sites that say who
- * already occupies one. Both readings are lexical (no type-checker program):
- * the client catalog generator consumes them, and the same scan doubles as its
- * own exhaustiveness backstop because it reads every source file rather than a
- * reachable-export closure.
+ * that type every slot, and the `slots.register` / `slots.registerFactory`
+ * call sites that say who occupies or declares one. The scanner resolves named
+ * child tables through local bindings and relative imports.
  */
 
 import { globSync, readFileSync } from 'node:fs'
@@ -17,14 +15,14 @@ const SLOTS_MODULE = '@deepseek-ai/dsh-client-ui-slots'
 /** Cheap textual prefilter for a slot-contract merge, quote-style agnostic. */
 const MERGE_HEAD = /declare module ['"]@deepseek-ai\/dsh-client-ui-slots['"]/
 
-/** Cheap textual prefilter for a registration call site. */
-const REGISTER_HEAD = /\.register\(/
+/** Cheap textual prefilter for a Slot or Factory registration call site. */
+const REGISTER_HEAD = /\.(?:register|registerFactory)\(/
 
 /** One `SlotMap` member: the slot's contract as its owning package declares it. */
 export interface SlotDeclaration {
   /** SlotMap key, e.g. `settings.section`. */
   key: string
-  /** Cardinality literal (`single` / `list` / `keyed` / `chain`), or '' when not a literal. */
+  /** Cardinality literal (`single` / `list` / `keyed` / `chain` / `hoc`), or '' when not a literal. */
   kind: string
   /** Data-scope literal (`root` / `session` / `session-maybe`), or '' when not a literal. */
   scope: string
@@ -44,7 +42,7 @@ export interface SlotDeclaration {
   source: string
 }
 
-/** One `slots.register({ name, … }, Component)` call site. */
+/** One `slots.register()` or `slots.registerFactory()` call site. */
 export interface SlotRegistration {
   /** Target SlotMap key the entry contributes into. */
   key: string
@@ -58,6 +56,8 @@ export interface SlotRegistration {
   entryKey?: string
   /** SlotMap keys this registration declares as children (they exist while it is mounted). */
   children: string[]
+  /** Whether this call installs a Factory definition instead of occupying an ordinary Slot. */
+  factory?: boolean
   /** Source pointer `packages/…/file.ts:line`. */
   source: string
 }
@@ -183,9 +183,9 @@ export function slotDeclarations(file: ScannedFile): SlotDeclaration[] {
 }
 
 /**
- * Read every registration call site in one scanned file: which slot it
- * occupies, with which component and cell identity, and which child slots it
- * declares. A call whose `name` is not a string literal is skipped — the
+ * Read every Slot or Factory registration call site in one scanned file: which
+ * name it targets, with which component and cell identity, and which ordinary
+ * child slots it declares. A call whose `name` is not a string literal is skipped — the
  * shipped composition always names its target literally, and a computed name
  * carries no catalog fact.
  * @param file - a file returned by {@link scanSlotFiles}.
@@ -193,10 +193,12 @@ export function slotDeclarations(file: ScannedFile): SlotDeclaration[] {
  */
 export function slotRegistrations(file: ScannedFile): SlotRegistration[] {
   const out: SlotRegistration[] = []
+  let checker: ts.TypeChecker | undefined
+  const bindings = () => checker ??= localBindings(file.sf)
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node)
       && ts.isPropertyAccessExpression(node.expression)
-      && node.expression.name.text === 'register'
+      && (node.expression.name.text === 'register' || node.expression.name.text === 'registerFactory')
       && isSlotsReceiver(node.expression.expression, file.sf)
       && node.arguments.length >= 1) {
       const options = node.arguments[0]
@@ -209,9 +211,10 @@ export function slotRegistrations(file: ScannedFile): SlotRegistration[] {
             key,
             package: file.package,
             component: componentText(node.arguments[1], file.sf),
+            ...node.expression.name.text === 'registerFactory' ? { factory: true } : {},
             ...id === undefined ? {} : { id },
             ...entryKey === undefined ? {} : { entryKey },
-            children: childKeys(options),
+            children: childKeys(options, bindings),
             source: `${file.rel}:${String(lineOf(file.sf, node))}`,
           })
         }
@@ -313,14 +316,15 @@ function packageNameOf(scanRoot: string, rel: string, cache: Map<string, string>
   while (dir.length > scanRoot.length) {
     const cached = cache.get(dir)
     if (cached !== undefined) return cached
+    let manifest: { name?: unknown } | null | undefined
     try {
-      const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { name?: unknown }
-      if (typeof manifest.name === 'string') {
-        cache.set(dir, manifest.name)
-        return manifest.name
-      }
-    } catch {
-      // No manifest at this level: keep walking up to the owning package root.
+      manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { name?: unknown } | null
+    } catch (_noManifest) {
+      // No readable manifest at this level: keep walking up to the owning package root.
+    }
+    if (typeof manifest?.name === 'string') {
+      cache.set(dir, manifest.name)
+      return manifest.name
     }
     dir = dirname(dir)
   }
@@ -409,16 +413,50 @@ function stringProperty(options: ts.ObjectLiteralExpression, name: string): stri
   return undefined
 }
 
+/** Bind the scanned AST and its relative imports without loading installed packages or build outputs. */
+function localBindings(source: ts.SourceFile): ts.TypeChecker {
+  const options: ts.CompilerOptions = { noLib: true, types: [], module: ts.ModuleKind.Preserve }
+  const host = ts.createCompilerHost(options, true)
+  const read = host.getSourceFile.bind(host)
+  host.getSourceFile = (name, ...args) => name === source.fileName ? source : read(name, ...args)
+  host.resolveModuleNameLiterals = (imports, from) => imports.map(({ text }) => text.startsWith('.')
+    ? ts.resolveModuleName(text, from, options, host)
+    : { resolvedModule: undefined })
+  return ts.createProgram([source.fileName], options, host).getTypeChecker()
+}
+
 /** The SlotMap keys a registration's `children` table declares. */
-function childKeys(options: ts.ObjectLiteralExpression): string[] {
+function childKeys(options: ts.ObjectLiteralExpression, bindings: () => ts.TypeChecker): string[] {
   for (const property of options.properties) {
-    if (!ts.isPropertyAssignment(property)) continue
+    if (!ts.isPropertyAssignment(property) && !ts.isShorthandPropertyAssignment(property)) continue
     if (memberName(property.name) !== 'children') continue
-    if (!ts.isObjectLiteralExpression(property.initializer)) return []
-    return property.initializer.properties
-      .flatMap(child => (child.name === undefined ? [] : [memberName(child.name)]))
+    const table = ts.isPropertyAssignment(property) ? property.initializer : property.name
+    return [...new Set(tableKeys(table, bindings, new Set()))]
   }
   return []
+}
+
+/** Read literal keys, including those contributed by const tables and their spreads. */
+function tableKeys(expr: ts.Expression, bindings: () => ts.TypeChecker, seen: Set<ts.Declaration>): string[] {
+  if (ts.isAsExpression(expr) || ts.isSatisfiesExpression(expr) || ts.isParenthesizedExpression(expr)) {
+    return tableKeys(expr.expression, bindings, seen)
+  }
+  if (ts.isObjectLiteralExpression(expr)) {
+    return expr.properties.flatMap(child => ts.isSpreadAssignment(child)
+      ? tableKeys(child.expression, bindings, seen)
+      : [memberName(child.name)])
+  }
+  if (!ts.isIdentifier(expr)) return []
+  const checker = bindings()
+  const symbol = ts.isShorthandPropertyAssignment(expr.parent)
+    ? checker.getShorthandAssignmentValueSymbol(expr.parent)
+    : checker.getSymbolAtLocation(expr)
+  if (symbol === undefined) return []
+  const variable = (symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol).valueDeclaration
+  if (variable === undefined || !ts.isVariableDeclaration(variable) || variable.initializer === undefined
+    || !(variable.parent.flags & ts.NodeFlags.Const) || seen.has(variable)) return []
+  seen.add(variable)
+  return tableKeys(variable.initializer, bindings, seen)
 }
 
 /** The component argument as written; a non-identifier expression is collapsed. */

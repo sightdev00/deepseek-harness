@@ -8,8 +8,9 @@ import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { CompactionId } from '@deepseek-ai/dsh-compaction/types'
 import {
-  CompactionId,
   CompactionEngine,
   type CompactionAgentContext,
   type CompactionResult,
@@ -17,9 +18,9 @@ import {
   type ManualCompactAgentContext,
 } from '@deepseek-ai/dsh-compaction'
 import * as commandCompact from '@deepseek-ai/dsh-command-compact'
-import { Session, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
+import { Session, type SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 
-const COMPACTION_ID = CompactionId('loader-command-compact-test')
+const COMPACTION_ID = brandString<CompactionId>('loader-command-compact-test')
 
 const RESULT: CompactionResult = {
   compactionId: COMPACTION_ID,
@@ -50,13 +51,13 @@ class LoaderCompactionEngine extends CompactionEngine {
     _signal: AbortSignal,
     sourceCommandId?: Parameters<CompactionEngine['compactNow']>[2],
   ): Promise<CompactionResult | null> {
-    const provenance = {
+    const operationIds = {
       compactionId: RESULT.compactionId,
       ...sourceCommandId === undefined ? {} : { sourceCommandId },
     }
-    agent.session.append('compaction/start', { ...provenance, turn: null })
+    agent.session.append('compaction/start', { ...operationIds, turn: null })
     agent.session.append('compaction/summary', {
-      ...provenance,
+      ...operationIds,
       summary: RESULT.summary,
       shadowedRange: RESULT.shadowedRange,
       shadowedSeqs: RESULT.shadowedSeqs,
@@ -64,8 +65,8 @@ class LoaderCompactionEngine extends CompactionEngine {
       provider: 'loader-test',
       model: 'loader-test',
     })
-    agent.session.append('compaction/end', { ...provenance, turn: null })
-    return Promise.resolve({ ...RESULT, ...provenance })
+    agent.session.append('compaction/end', { ...operationIds, turn: null })
+    return Promise.resolve({ ...RESULT, ...operationIds })
   }
 }
 
@@ -112,7 +113,7 @@ describe('command-compact real Loader composition', () => {
     })
     await context.loader.await()
 
-    const session = Session.create(SessionId('loader-command-compact'))
+    const session = Session.create(brandString<SessionId>('loader-command-compact'))
     const agent = {
       session,
       status: 'idle',
@@ -120,6 +121,7 @@ describe('command-compact real Loader composition', () => {
       reserveTurnAdmission: () => () => undefined,
     } as unknown as Agent
     expect(context.commands.list(agent)).toContainEqual({
+      definitionId: '@deepseek-ai/dsh-command-compact',
       name: 'compact',
       description: 'Compact older conversation history',
     })

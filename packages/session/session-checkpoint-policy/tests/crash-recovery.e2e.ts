@@ -6,15 +6,16 @@ import { execa } from 'execa'
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import SessionStore, {
-  SessionId, TOOL_OUTCOME_UNKNOWN, interruptedTurnClosers,
+  type SessionId, TOOL_OUTCOME_UNKNOWN, interruptedTurnClosers,
   type SessionEvent,
 } from '@deepseek-ai/dsh-session'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 const repoRoot = fileURLToPath(new URL('../../../../', import.meta.url))
 const childScript = fileURLToPath(new URL('./fixtures/crash-child.ts', import.meta.url))
 const tsxLoader = fileURLToPath(import.meta.resolve('tsx'))
-const sessionId = SessionId('semantic-checkpoint-crash')
+const sessionId = brandString<SessionId>('semantic-checkpoint-crash')
 const roots: string[] = []
 const CHILD_FAILPOINT_TIMEOUT_MS = 30_000
 
@@ -74,7 +75,7 @@ async function load(root: string): Promise<SessionEvent[]> {
   try {
     const handle = await ctx.sessionPersistence.open(sessionId, 'read')
     try {
-      const events = await handle.read()
+      const { events } = await handle.read()
       return [...events, ...interruptedTurnClosers(events)]
     } finally {
       await handle.close()
@@ -95,7 +96,7 @@ describe.skipIf(process.platform === 'win32')('semantic checkpoint hard-crash re
     const events = await load(crashed.root)
     expect(events.map(event => event.type)).toEqual([
       'agent/inbox/spliced', 'turn/start', 'agent/inbox/spliced',
-      'step/start', 'user/message', 'request/header', 'request/context', 'step/end', 'turn/end',
+      'step/start', 'system/message', 'user/message', 'request/header', 'request/context', 'step/end', 'turn/end',
     ])
     expect(events.at(-1)).toMatchObject({
       type: 'turn/end', data: { reason: { kind: 'interrupted' } },
@@ -112,9 +113,9 @@ describe.skipIf(process.platform === 'win32')('semantic checkpoint hard-crash re
     expect(result?.type === 'tool/result' && result.data.error).toEqual({
       name: 'ToolOutcomeUnknownError', code: TOOL_OUTCOME_UNKNOWN,
     })
-    if (result?.type !== 'tool/result' || result.data.message.content[0].content[0]?.type !== 'text') {
+    if (result?.type !== 'tool/result' || result.data.message.content[0]?.type !== 'text') {
       throw new Error('expected a text tool result')
     }
-    expect(result.data.message.content[0].content[0].text).toContain('Do not retry blindly.')
+    expect(result.data.message.content[0].text).toContain('Do not retry blindly.')
   })
 })

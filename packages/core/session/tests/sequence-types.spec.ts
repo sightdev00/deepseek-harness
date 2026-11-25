@@ -1,7 +1,8 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import {
   Session,
-  SessionId,
+  SESSION_FORMAT_VERSION,
+  type SessionId,
   SessionLogOffset,
   SessionSeq,
   type OptionalSessionSeq,
@@ -10,6 +11,7 @@ import {
   type SessionSeq as SessionSeqType,
   type SessionSeqCursor,
 } from '@deepseek-ai/dsh-session'
+import { brandString } from '@deepseek-ai/dsh-brand'
 
 describe('Session log positions', () => {
   it('admits non-negative safe integers into distinct sequence roles', () => {
@@ -34,7 +36,7 @@ describe('Session log positions', () => {
   )
 
   it('keeps event identities separate from log offsets', () => {
-    const session = Session.create(SessionId('typed-positions'))
+    const session = Session.create(brandString<SessionId>('typed-positions'))
     const event = session.append('turn/start', { turn: 1 })
 
     expect(event.seq).toBe(0)
@@ -46,21 +48,23 @@ describe('Session log positions', () => {
   })
 
   it('rejects a negative-zero seq at the restored event boundary', () => {
-    const id = SessionId('negative-zero-event')
-    expect(() => Session.fromRestore(id, [{
-      type: 'turn/start', seq: -0, time: 1, data: { turn: 1 },
-    }] as never, {
-      version: 0, id, createdAt: 1, isSeeded: false,
-    }, SessionLogOffset(0))).toThrow(/invalid event envelope/)
+    const id = brandString<SessionId>('negative-zero-event')
+    expect(() => Session.fromRestore(
+      id,
+      [{ type: 'turn/start', seq: -0, time: 1, data: { turn: 1 } }] as never,
+      { version: SESSION_FORMAT_VERSION, id, createdAt: 1, isSeeded: false },
+      SessionLogOffset(0),
+      'detached',
+    )).toThrow(/invalid event envelope/)
   })
 
   it('keeps fork lineage outside the logical header integer fields', () => {
-    const source = Session.create(SessionId('source'))
+    const source = Session.create(brandString<SessionId>('source'))
     source.append('turn/start', { turn: 1 })
     source.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
-    const id = SessionId('child')
+    const id = brandString<SessionId>('child')
     const header: SessionHeader = {
-      version: 0,
+      version: SESSION_FORMAT_VERSION,
       id,
       createdAt: 1,
       isSeeded: true,
@@ -76,40 +80,55 @@ describe('Session log positions', () => {
     expect(child.isOwnSeq(SessionSeq(2))).toBe(true)
     expect(child.isOwnSeq(SessionSeq(3))).toBe(false)
 
-    const fresh = Session.create(SessionId('fresh'))
+    const fresh = Session.create(brandString<SessionId>('fresh'))
     expect(fresh.header.isSeeded).toBe(false)
     expect(fresh.inheritedEventCount).toBe(0)
   })
 
-  it('retains a child-owned constructor-seed suffix after the inherited cut', () => {
-    const parent = Session.create(SessionId('suffix-parent'))
+  it('appends child-owned setup after the constructor-owned inherited marker', () => {
+    const parent = Session.create(brandString<SessionId>('suffix-parent'))
     parent.append('turn/start', { turn: 1 })
     parent.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
-    const assembled = Session.create(SessionId('assembled-seed'), parent.snapshotEvents())
-    assembled.append('request/context', { provider: 'provider', model: 'model' })
-    const id = SessionId('suffix-child')
+    const id = brandString<SessionId>('suffix-child')
 
-    const child = Session.create(id, assembled.snapshotEvents(), {
-      version: 0,
+    const child = Session.create(id, parent.snapshotEvents(), {
+      version: SESSION_FORMAT_VERSION,
       id,
       createdAt: 1,
       isSeeded: true,
     }, parent.seq)
+    child.append('request/context', { provider: 'provider', model: 'model' })
 
     expect(child.ownEvents().map(event => event.type)).toEqual([
       'session/end-seed',
       'request/context',
-      'session/end-seed',
     ])
     expect(child.isOwnSeq(SessionSeq(1))).toBe(false)
     expect(child.isOwnSeq(SessionSeq(2))).toBe(true)
     expect(child.isOwnSeq(SessionSeq(3))).toBe(true)
   })
 
+  it('accepts child closers after the inherited marker and rejects a later inherited marker', () => {
+    const id = brandString<SessionId>('marked-fork')
+    const header: SessionHeader = { version: SESSION_FORMAT_VERSION, id, createdAt: 1, isSeeded: true }
+    const seed = [
+      { type: 'turn/start', seq: SessionSeq(0), time: 1, data: { turn: 1 } },
+      { type: 'session/end-seed', seq: SessionSeq(1), time: 2, data: { inherited: true } },
+      { type: 'turn/end', seq: SessionSeq(2), time: 3, data: { turn: 1, reason: { kind: 'forked' } } },
+    ] as const
+    const child = Session.create(id, seed, header, SessionLogOffset(1))
+    expect(child.snapshotEvents()).toEqual(seed)
+    expect(child.ownEvents().map(event => event.type)).toEqual(['session/end-seed', 'turn/end'])
+    expect(child.firstLiveSeq).toBe(3)
+    expect(() => Session.create(id, [...seed, {
+      type: 'session/end-seed', seq: SessionSeq(3), time: 4, data: { inherited: true },
+    }], header, SessionLogOffset(1))).toThrow('final inherited marker')
+  })
+
   it('requires a separately supplied inherited cut for a seeded header', () => {
-    const id = SessionId('missing-cut')
+    const id = brandString<SessionId>('missing-cut')
     expect(() => Session.create(id, [], {
-      version: 0,
+      version: SESSION_FORMAT_VERSION,
       id,
       createdAt: 1,
       isSeeded: true,
@@ -117,9 +136,9 @@ describe('Session log positions', () => {
   })
 
   it('requires an explicit constructor seed for seeded lineage', () => {
-    const id = SessionId('missing-seed')
+    const id = brandString<SessionId>('missing-seed')
     expect(() => Session.create(id, undefined, {
-      version: 0,
+      version: SESSION_FORMAT_VERSION,
       id,
       createdAt: 1,
       isSeeded: true,
@@ -127,23 +146,32 @@ describe('Session log positions', () => {
   })
 
   it('requires the exact cut to agree with lineage and log length', () => {
-    const unseededId = SessionId('unseeded-nonzero-cut')
+    const unseededId = brandString<SessionId>('unseeded-nonzero-cut')
     expect(() => Session.create(unseededId, [], {
-      version: 0, id: unseededId, createdAt: 1, isSeeded: false,
+      version: SESSION_FORMAT_VERSION, id: unseededId, createdAt: 1, isSeeded: false,
     }, SessionLogOffset(1))).toThrow(/unseeded session inherited event count must be 0/)
 
-    const seededId = SessionId('seeded-oversized-cut')
+    const seededId = brandString<SessionId>('seeded-oversized-cut')
     expect(() => Session.create(seededId, [], {
-      version: 0, id: seededId, createdAt: 1, isSeeded: true,
+      version: SESSION_FORMAT_VERSION, id: seededId, createdAt: 1, isSeeded: true,
     }, SessionLogOffset(1))).toThrow(/inherited event count exceeds its event log/)
+
+    const shortCutId = brandString<SessionId>('seeded-short-cut')
+    const seed = [
+      { type: 'turn/start', seq: SessionSeq(0), time: 1, data: { turn: 1 } },
+      { type: 'turn/end', seq: SessionSeq(1), time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+    ] as const
+    expect(() => Session.create(shortCutId, seed, {
+      version: SESSION_FORMAT_VERSION, id: shortCutId, createdAt: 1, isSeeded: true,
+    }, SessionLogOffset(1))).toThrow(/constructor seed must equal its inherited prefix/)
   })
 
   it.each([-1, 0.5, Number.MAX_SAFE_INTEGER + 1])(
     'revalidates a supplied inherited event count (%s)',
     (value) => {
-      const id = SessionId(`bad-inherited-count-${value}`)
+      const id = brandString<SessionId>(`bad-inherited-count-${value}`)
       expect(() => Session.create(id, [], {
-        version: 0,
+        version: SESSION_FORMAT_VERSION,
         id,
         createdAt: 1,
         isSeeded: true,
